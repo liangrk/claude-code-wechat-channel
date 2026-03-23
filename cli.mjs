@@ -10,7 +10,7 @@
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, renameSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,33 +51,40 @@ function install() {
     mcpServers: {
       wechat: {
         command: "npx",
-        args: ["-y", "claude-code-wechat-channel", "start"],
+        args: ["-y", "@liangrk/claude-code-wechatbot", "start"],
       },
     },
   };
 
   const mcpPath = resolve(process.cwd(), ".mcp.json");
+  const tmpPath = mcpPath + ".tmp";
+
+  function atomicWrite(filePath, content) {
+    writeFileSync(tmpPath, content, "utf-8");
+    renameSync(tmpPath, filePath);
+  }
 
   if (existsSync(mcpPath)) {
     try {
       const existing = JSON.parse(readFileSync(mcpPath, "utf-8"));
       existing.mcpServers = existing.mcpServers || {};
       existing.mcpServers.wechat = mcpConfig.mcpServers.wechat;
-      writeFileSync(mcpPath, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+      atomicWrite(mcpPath, JSON.stringify(existing, null, 2) + "\n");
       console.log(`Updated: ${mcpPath}`);
-    } catch {
-      writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2) + "\n", "utf-8");
+    } catch (err) {
+      console.error(`Warning: Failed to update existing .mcp.json: ${err}`);
+      atomicWrite(mcpPath, JSON.stringify(mcpConfig, null, 2) + "\n");
       console.log(`Created: ${mcpPath}`);
     }
   } else {
-    writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2) + "\n", "utf-8");
+    atomicWrite(mcpPath, JSON.stringify(mcpConfig, null, 2) + "\n");
     console.log(`Created: ${mcpPath}`);
   }
 
   console.log(`
 Next steps:
   1. Run: npx claude-code-wechat-channel setup
-  2. Then: claude --dangerously-load-development-channels server:wechat
+  2. Then: claude (in the same directory as .mcp.json)
 `);
 }
 

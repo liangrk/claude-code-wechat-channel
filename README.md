@@ -39,8 +39,10 @@ npx @liangrk/claude-code-wechatbot install
 
 ### 3. 启动 Claude Code + WeChat 通道
 
+在包含 `.mcp.json` 的目录下启动 Claude Code 即可，MCP server 会自动加载：
+
 ```bash
-claude --dangerously-load-development-channels server:wechat
+claude
 ```
 
 ### 4. 在微信中发消息
@@ -76,7 +78,7 @@ npm install -g @liangrk/claude-code-wechatbot
 
 ## 注意事项
 
-- 当前为 research preview 阶段，需要使用 `--dangerously-load-development-channels` 标志
+- Claude Code 会自动加载 `.mcp.json` 中的 MCP server 配置
 - Claude Code 会话关闭后通道也会断开
 - 微信 ClawBot 目前仅支持 iOS 最新版
 - 每个 ClawBot 只能连接一个 agent 实例
