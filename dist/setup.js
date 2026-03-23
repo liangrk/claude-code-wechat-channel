@@ -1,20 +1,33 @@
 #!/usr/bin/env bun
-// @bun
 import { createRequire } from "node:module";
 var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+function __accessProp(key) {
+  return this[key];
+}
+var __toESMCache_node;
+var __toESMCache_esm;
 var __toESM = (mod, isNodeMode, target) => {
+  var canCache = mod != null && typeof mod === "object";
+  if (canCache) {
+    var cache = isNodeMode ? __toESMCache_node ??= new WeakMap : __toESMCache_esm ??= new WeakMap;
+    var cached = cache.get(mod);
+    if (cached)
+      return cached;
+  }
   target = mod != null ? __create(__getProtoOf(mod)) : {};
   const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
   for (let key of __getOwnPropNames(mod))
     if (!__hasOwnProp.call(to, key))
       __defProp(to, key, {
-        get: () => mod[key],
+        get: __accessProp.bind(mod, key),
         enumerable: true
       });
+  if (canCache)
+    cache.set(mod, to);
   return to;
 };
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
@@ -1038,27 +1051,47 @@ var require_main = __commonJS((exports, module) => {
 });
 
 // setup.ts
-import fs from "fs";
-import path from "path";
+import fs2 from "node:fs";
+
+// shared.ts
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 var DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 var BOT_TYPE = "3";
-var CREDENTIALS_DIR = path.join(process.env.HOME || "~", ".claude", "channels", "wechat");
-var CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "account.json");
+function getHomeDir() {
+  return os.homedir();
+}
+function getCredentialsDir() {
+  return path.join(getHomeDir(), ".claude", "channels", "wechat");
+}
+function getCredentialsFile() {
+  return path.join(getCredentialsDir(), "account.json");
+}
+function saveCredentials(data) {
+  const dir = getCredentialsDir();
+  const file = getCredentialsFile();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf-8");
+  try {
+    fs.chmodSync(file, 384);
+  } catch {}
+}
 async function fetchQRCode(baseUrl) {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  const url = `${base}ilink/bot/get_bot_qrcode?bot_type=${BOT_TYPE}`;
-  const res = await fetch(url);
+  const url = new URL(`ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(BOT_TYPE)}`, base);
+  const res = await fetch(url.toString());
   if (!res.ok)
     throw new Error(`QR fetch failed: ${res.status}`);
   return await res.json();
 }
 async function pollQRStatus(baseUrl, qrcode) {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  const url = `${base}ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
+  const url = new URL(`ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`, base);
   const controller = new AbortController;
   const timer = setTimeout(() => controller.abort(), 35000);
   try {
-    const res = await fetch(url, {
+    const res = await fetch(url.toString(), {
       headers: { "iLink-App-ClientVersion": "1" },
       signal: controller.signal
     });
@@ -1074,29 +1107,34 @@ async function pollQRStatus(baseUrl, qrcode) {
     throw err;
   }
 }
+
+// setup.ts
 async function main() {
-  if (fs.existsSync(CREDENTIALS_FILE)) {
+  const CREDENTIALS_FILE = getCredentialsFile();
+  if (fs2.existsSync(CREDENTIALS_FILE)) {
     try {
-      const existing = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf-8"));
-      console.log(`\u5DF2\u6709\u4FDD\u5B58\u7684\u8D26\u53F7: ${existing.accountId}`);
-      console.log(`\u4FDD\u5B58\u65F6\u95F4: ${existing.savedAt}`);
+      const existing = JSON.parse(fs2.readFileSync(CREDENTIALS_FILE, "utf-8"));
+      console.log(`已有保存的账号: ${existing.accountId}`);
+      console.log(`保存时间: ${existing.savedAt}`);
       console.log();
-      const readline = await import("readline");
+      const readline = await import("node:readline");
       const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout
       });
       const answer = await new Promise((resolve) => {
-        rl.question("\u662F\u5426\u91CD\u65B0\u767B\u5F55\uFF1F(y/N) ", resolve);
+        rl.question("是否重新登录？(y/N) ", resolve);
       });
       rl.close();
       if (answer.toLowerCase() !== "y") {
-        console.log("\u4FDD\u6301\u73B0\u6709\u51ED\u636E\uFF0C\u9000\u51FA\u3002");
+        console.log("保持现有凭据，退出。");
         process.exit(0);
       }
-    } catch {}
+    } catch (err) {
+      console.error(`读取已有凭据失败: ${String(err)}`);
+    }
   }
-  console.log(`\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...
+  console.log(`正在获取微信登录二维码...
 `);
   const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
   try {
@@ -1108,10 +1146,10 @@ async function main() {
       });
     });
   } catch {
-    console.log(`\u8BF7\u5728\u6D4F\u89C8\u5668\u4E2D\u6253\u5F00\u6B64\u94FE\u63A5\u626B\u7801: ${qrResp.qrcode_img_content}
+    console.log(`请在浏览器中打开此链接扫码: ${qrResp.qrcode_img_content}
 `);
   }
-  console.log(`\u8BF7\u7528\u5FAE\u4FE1\u626B\u63CF\u4E0A\u65B9\u4E8C\u7EF4\u7801...
+  console.log(`请用微信扫描上方二维码...
 `);
   const deadline = Date.now() + 480000;
   let scannedPrinted = false;
@@ -1124,19 +1162,19 @@ async function main() {
       case "scaned":
         if (!scannedPrinted) {
           console.log(`
-\uD83D\uDC40 \u5DF2\u626B\u7801\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4...`);
+\uD83D\uDC40 已扫码，请在微信中确认...`);
           scannedPrinted = true;
         }
         break;
       case "expired":
         console.log(`
-\u4E8C\u7EF4\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C setup\u3002`);
+二维码已过期，请重新运行 setup。`);
         process.exit(1);
         break;
       case "confirmed": {
         if (!status.ilink_bot_id || !status.bot_token) {
           console.error(`
-\u767B\u5F55\u5931\u8D25\uFF1A\u670D\u52A1\u5668\u672A\u8FD4\u56DE\u5B8C\u6574\u4FE1\u606F\u3002`);
+登录失败：服务器未返回完整信息。`);
           process.exit(1);
         }
         const account = {
@@ -1146,29 +1184,25 @@ async function main() {
           userId: status.ilink_user_id,
           savedAt: new Date().toISOString()
         };
-        fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
-        fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(account, null, 2), "utf-8");
-        try {
-          fs.chmodSync(CREDENTIALS_FILE, 384);
-        } catch {}
+        saveCredentials(account);
         console.log(`
-\u2705 \u5FAE\u4FE1\u8FDE\u63A5\u6210\u529F\uFF01`);
-        console.log(`   \u8D26\u53F7 ID: ${account.accountId}`);
-        console.log(`   \u7528\u6237 ID: ${account.userId}`);
-        console.log(`   \u51ED\u636E\u4FDD\u5B58\u81F3: ${CREDENTIALS_FILE}`);
+✅ 微信连接成功！`);
+        console.log(`   账号 ID: ${account.accountId}`);
+        console.log(`   用户 ID: ${account.userId}`);
+        console.log(`   凭据保存至: ${getCredentialsFile()}`);
         console.log();
-        console.log("\u73B0\u5728\u53EF\u4EE5\u542F\u52A8 Claude Code \u901A\u9053\uFF1A");
-        console.log("  claude --dangerously-load-development-channels server:wechat");
+        console.log("现在可以启动 Claude Code 通道：");
+        console.log("  claude --dangerously-skip-permissions");
         process.exit(0);
       }
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
   console.log(`
-\u767B\u5F55\u8D85\u65F6\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C\u3002`);
+登录超时，请重新运行。`);
   process.exit(1);
 }
 main().catch((err) => {
-  console.error(`\u9519\u8BEF: ${err}`);
+  console.error(`错误: ${err}`);
   process.exit(1);
 });

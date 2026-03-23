@@ -9,68 +9,20 @@
  * The channel server reads them at startup.
  */
 
-import crypto from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
 
-const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
-const BOT_TYPE = "3";
-const CREDENTIALS_DIR = path.join(
-  process.env.HOME || "~",
-  ".claude",
-  "channels",
-  "wechat",
-);
-const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "account.json");
-
-interface QRCodeResponse {
-  qrcode: string;
-  qrcode_img_content: string;
-}
-
-interface QRStatusResponse {
-  status: "wait" | "scaned" | "confirmed" | "expired";
-  bot_token?: string;
-  ilink_bot_id?: string;
-  baseurl?: string;
-  ilink_user_id?: string;
-}
-
-async function fetchQRCode(baseUrl: string): Promise<QRCodeResponse> {
-  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  const url = `${base}ilink/bot/get_bot_qrcode?bot_type=${BOT_TYPE}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`QR fetch failed: ${res.status}`);
-  return (await res.json()) as QRCodeResponse;
-}
-
-async function pollQRStatus(
-  baseUrl: string,
-  qrcode: string,
-): Promise<QRStatusResponse> {
-  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  const url = `${base}ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 35_000);
-  try {
-    const res = await fetch(url, {
-      headers: { "iLink-App-ClientVersion": "1" },
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error(`QR status failed: ${res.status}`);
-    return (await res.json()) as QRStatusResponse;
-  } catch (err) {
-    clearTimeout(timer);
-    if (err instanceof Error && err.name === "AbortError") {
-      return { status: "wait" };
-    }
-    throw err;
-  }
-}
+import {
+  DEFAULT_BASE_URL,
+  type AccountData,
+  saveCredentials,
+  getCredentialsFile,
+  fetchQRCode,
+  pollQRStatus,
+} from "./shared.js";
 
 async function main() {
   // Check existing credentials
+  const CREDENTIALS_FILE = getCredentialsFile();
   if (fs.existsSync(CREDENTIALS_FILE)) {
     try {
       const existing = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf-8"));
@@ -90,8 +42,8 @@ async function main() {
         console.log("保持现有凭据，退出。");
         process.exit(0);
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      console.error(`读取已有凭据失败: ${String(err)}`);
     }
   }
 
@@ -143,7 +95,7 @@ async function main() {
           process.exit(1);
         }
 
-        const account = {
+        const account: AccountData = {
           token: status.bot_token,
           baseUrl: status.baseurl || DEFAULT_BASE_URL,
           accountId: status.ilink_bot_id,
@@ -151,26 +103,16 @@ async function main() {
           savedAt: new Date().toISOString(),
         };
 
-        fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
-        fs.writeFileSync(
-          CREDENTIALS_FILE,
-          JSON.stringify(account, null, 2),
-          "utf-8",
-        );
-        try {
-          fs.chmodSync(CREDENTIALS_FILE, 0o600);
-        } catch {
-          // best-effort
-        }
+        saveCredentials(account);
 
         console.log(`\n✅ 微信连接成功！`);
         console.log(`   账号 ID: ${account.accountId}`);
         console.log(`   用户 ID: ${account.userId}`);
-        console.log(`   凭据保存至: ${CREDENTIALS_FILE}`);
+        console.log(`   凭据保存至: ${getCredentialsFile()}`);
         console.log();
         console.log("现在可以启动 Claude Code 通道：");
         console.log(
-          "  claude --dangerously-load-development-channels server:wechat",
+          "  claude --dangerously-skip-permissions",
         );
         process.exit(0);
       }
