@@ -24,7 +24,7 @@ Claude Code ← MCP Channel Protocol ← wechat_reply tool
 ### 1. 微信扫码登录
 
 ```bash
-npx claude-code-wechat-channel setup
+npx @liangrk/claude-code-wechatbot setup
 ```
 
 终端会显示二维码，用微信扫描并确认。凭据保存到 `~/.claude/channels/wechat/account.json`。
@@ -32,7 +32,7 @@ npx claude-code-wechat-channel setup
 ### 2. 生成 MCP 配置
 
 ```bash
-npx claude-code-wechat-channel install
+npx @liangrk/claude-code-wechatbot install
 ```
 
 这会在当前目录生成（或更新） `.mcp.json`，指向本插件。
@@ -51,10 +51,18 @@ claude --dangerously-load-development-channels server:wechat
 
 | 命令 | 说明 |
 |------|------|
-| `npx claude-code-wechat-channel setup` | 微信扫码登录 |
-| `npx claude-code-wechat-channel install` | 生成 .mcp.json 配置 |
-| `npx claude-code-wechat-channel start` | 启动 MCP Channel 服务器 |
-| `npx claude-code-wechat-channel help` | 显示帮助 |
+| `npx @liangrk/claude-code-wechatbot setup` | 微信扫码登录 |
+| `npx @liangrk/claude-code-wechatbot install` | 生成 .mcp.json 配置 |
+| `npx @liangrk/claude-code-wechatbot start` | 启动 MCP Channel 服务器 |
+| `npx @liangrk/claude-code-wechatbot help` | 显示帮助 |
+
+## 安装
+
+```bash
+npm install -g @liangrk/claude-code-wechatbot
+```
+
+全局安装后可直接使用 `claude-code-wechat-channel` 命令，无需每次 `npx`。
 
 ## 技术细节
 
@@ -62,6 +70,9 @@ claude --dangerously-load-development-channels server:wechat
 - **消息发送**: 通过 `ilink/bot/sendmessage` 发送回复
 - **认证**: 使用 `ilink/bot/get_bot_qrcode` QR 码登录获取 Bearer Token
 - **协议**: 基于 MCP (Model Context Protocol) 的 Channel 扩展
+- **支持消息类型**: 文本消息、语音消息（自动转文字）
+- **错误恢复**: 连续失败 3 次后指数退避，最大 60s
+- **实例锁**: 防止多个实例同时运行
 
 ## 注意事项
 
@@ -69,6 +80,7 @@ claude --dangerously-load-development-channels server:wechat
 - Claude Code 会话关闭后通道也会断开
 - 微信 ClawBot 目前仅支持 iOS 最新版
 - 每个 ClawBot 只能连接一个 agent 实例
+- 微信不支持 Markdown 渲染，回复会自动转为纯文本
 
 ## License
 
