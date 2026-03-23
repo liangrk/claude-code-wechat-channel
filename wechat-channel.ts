@@ -14,7 +14,8 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
+import process from "node:process";
+import { execSync } from "node:child_process";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -23,24 +24,35 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
+import {
+  type AccountData,
+  DEFAULT_BASE_URL,
+  LONG_POLL_TIMEOUT_MS,
+  loadCredentials,
+  saveCredentials,
+  getCredentialsDir,
+  getSyncBufFile,
+  getContextTokensFile,
+  getLockPidFile,
+  apiFetch,
+  fetchQRCode,
+  pollQRStatus,
+} from "./shared.js";
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const CHANNEL_NAME = "wechat";
 const CHANNEL_VERSION = "0.1.0";
-const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
-const BOT_TYPE = "3";
-const CREDENTIALS_DIR = path.join(
-  process.env.HOME || "~",
-  ".claude",
-  "channels",
-  "wechat",
-);
-const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "account.json");
 
-const LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
-const BACKOFF_DELAY_MS = 30_000;
-const RETRY_DELAY_MS = 2_000;
+const MAX_REPLY_LENGTH = 4096;
+const MAX_SENDER_ID_LENGTH = 256;
+const SEND_RETRY_COUNT = 2;
+const SEND_RETRY_DELAY_MS = 1_000;
+const CONTEXT_TOKEN_MAX_ENTRIES = 500;
+const CONTEXT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const LONG_POLL_TIMEOUT_MIN_MS = 10_000;
+const LONG_POLL_TIMEOUT_MAX_MS = 60_000;
 
 // ── Logging (stderr only — stdout is MCP stdio) ─────────────────────────────
 
@@ -50,208 +62,6 @@ function log(msg: string) {
 
 function logError(msg: string) {
   process.stderr.write(`[wechat-channel] ERROR: ${msg}\n`);
-}
-
-// ── Credentials ──────────────────────────────────────────────────────────────
-
-type AccountData = {
-  token: string;
-  baseUrl: string;
-  accountId: string;
-  userId?: string;
-  savedAt: string;
-};
-
-function loadCredentials(): AccountData | null {
-  try {
-    if (!fs.existsSync(CREDENTIALS_FILE)) return null;
-    return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf-8"));
-  } catch {
-    return null;
-  }
-}
-
-function saveCredentials(data: AccountData): void {
-  fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
-  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(data, null, 2), "utf-8");
-  try {
-    fs.chmodSync(CREDENTIALS_FILE, 0o600);
-  } catch {
-    // best-effort
-  }
-}
-
-// ── WeChat ilink API ─────────────────────────────────────────────────────────
-
-function randomWechatUin(): string {
-  const uint32 = crypto.randomBytes(4).readUInt32BE(0);
-  return Buffer.from(String(uint32), "utf-8").toString("base64");
-}
-
-function buildHeaders(token?: string, body?: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    AuthorizationType: "ilink_bot_token",
-    "X-WECHAT-UIN": randomWechatUin(),
-  };
-  if (body) {
-    headers["Content-Length"] = String(Buffer.byteLength(body, "utf-8"));
-  }
-  if (token?.trim()) {
-    headers.Authorization = `Bearer ${token.trim()}`;
-  }
-  return headers;
-}
-
-async function apiFetch(params: {
-  baseUrl: string;
-  endpoint: string;
-  body: string;
-  token?: string;
-  timeoutMs: number;
-}): Promise<string> {
-  const base = params.baseUrl.endsWith("/")
-    ? params.baseUrl
-    : `${params.baseUrl}/`;
-  const url = new URL(params.endpoint, base).toString();
-  const headers = buildHeaders(params.token, params.body);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), params.timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: params.body,
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
-    return text;
-  } catch (err) {
-    clearTimeout(timer);
-    throw err;
-  }
-}
-
-// ── QR Login ─────────────────────────────────────────────────────────────────
-
-interface QRCodeResponse {
-  qrcode: string;
-  qrcode_img_content: string;
-}
-
-interface QRStatusResponse {
-  status: "wait" | "scaned" | "confirmed" | "expired";
-  bot_token?: string;
-  ilink_bot_id?: string;
-  baseurl?: string;
-  ilink_user_id?: string;
-}
-
-async function fetchQRCode(baseUrl: string): Promise<QRCodeResponse> {
-  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  const url = new URL(
-    `ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(BOT_TYPE)}`,
-    base,
-  );
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`QR fetch failed: ${res.status}`);
-  return (await res.json()) as QRCodeResponse;
-}
-
-async function pollQRStatus(
-  baseUrl: string,
-  qrcode: string,
-): Promise<QRStatusResponse> {
-  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  const url = new URL(
-    `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`,
-    base,
-  );
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 35_000);
-  try {
-    const res = await fetch(url.toString(), {
-      headers: { "iLink-App-ClientVersion": "1" },
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error(`QR status failed: ${res.status}`);
-    return (await res.json()) as QRStatusResponse;
-  } catch (err) {
-    clearTimeout(timer);
-    if (err instanceof Error && err.name === "AbortError") {
-      return { status: "wait" };
-    }
-    throw err;
-  }
-}
-
-async function doQRLogin(
-  baseUrl: string,
-): Promise<AccountData | null> {
-  log("正在获取微信登录二维码...");
-  const qrResp = await fetchQRCode(baseUrl);
-
-  log("\n请使用微信扫描以下二维码：\n");
-  try {
-    const qrterm = await import("qrcode-terminal");
-    await new Promise<void>((resolve) => {
-      qrterm.default.generate(
-        qrResp.qrcode_img_content,
-        { small: true },
-        (qr: string) => {
-          process.stderr.write(qr + "\n");
-          resolve();
-        },
-      );
-    });
-  } catch {
-    log(`二维码链接: ${qrResp.qrcode_img_content}`);
-  }
-
-  log("等待扫码...");
-  const deadline = Date.now() + 480_000;
-  let scannedPrinted = false;
-
-  while (Date.now() < deadline) {
-    const status = await pollQRStatus(baseUrl, qrResp.qrcode);
-
-    switch (status.status) {
-      case "wait":
-        break;
-      case "scaned":
-        if (!scannedPrinted) {
-          log("👀 已扫码，请在微信中确认...");
-          scannedPrinted = true;
-        }
-        break;
-      case "expired":
-        log("二维码已过期，请重新启动。");
-        return null;
-      case "confirmed": {
-        if (!status.ilink_bot_id || !status.bot_token) {
-          logError("登录确认但未返回 bot 信息");
-          return null;
-        }
-        const account: AccountData = {
-          token: status.bot_token,
-          baseUrl: status.baseurl || baseUrl,
-          accountId: status.ilink_bot_id,
-          userId: status.ilink_user_id,
-          savedAt: new Date().toISOString(),
-        };
-        saveCredentials(account);
-        log("✅ 微信连接成功！");
-        return account;
-      }
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-
-  log("登录超时");
-  return null;
 }
 
 // ── WeChat Message Types ─────────────────────────────────────────────────────
@@ -300,6 +110,205 @@ const MSG_ITEM_VOICE = 3;
 const MSG_TYPE_BOT = 2;
 const MSG_STATE_FINISH = 2;
 
+// ── Context Token Cache (LRU with TTL) ──────────────────────────────────────
+
+interface ContextTokenEntry {
+  token: string;
+  lastAccessed: number;
+}
+
+const contextTokenCache = new Map<string, ContextTokenEntry>();
+
+function loadContextTokens(): void {
+  try {
+    const file = getContextTokensFile();
+    if (!fs.existsSync(file)) return;
+    const data = JSON.parse(fs.readFileSync(file, "utf-8")) as Record<string, { token: string; ts: number }>;
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(data)) {
+      if (now - entry.ts < CONTEXT_TOKEN_TTL_MS) {
+        contextTokenCache.set(key, { token: entry.token, lastAccessed: entry.ts });
+      }
+    }
+    log(`加载 context_token 缓存: ${contextTokenCache.size} 条`);
+  } catch {
+    // ignore corrupt file
+  }
+}
+
+function saveContextTokens(): void {
+  try {
+    const dir = getCredentialsDir();
+    const file = getContextTokensFile();
+    fs.mkdirSync(dir, { recursive: true });
+    const data: Record<string, { token: string; ts: number }> = {};
+    for (const [key, entry] of contextTokenCache.entries()) {
+      data[key] = { token: entry.token, ts: entry.lastAccessed };
+    }
+    fs.writeFileSync(file, JSON.stringify(data), "utf-8");
+    try {
+      fs.chmodSync(file, 0o600);
+    } catch {
+      // best-effort on platforms that don't support chmod
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+function evictContextTokens(): void {
+  const now = Date.now();
+  // Evict expired entries
+  for (const [key, entry] of contextTokenCache.entries()) {
+    if (now - entry.lastAccessed > CONTEXT_TOKEN_TTL_MS) {
+      contextTokenCache.delete(key);
+    }
+  }
+  // Evict oldest if still over max
+  if (contextTokenCache.size > CONTEXT_TOKEN_MAX_ENTRIES) {
+    const entries = [...contextTokenCache.entries()].sort(
+      (a, b) => a[1].lastAccessed - b[1].lastAccessed,
+    );
+    const toRemove = entries.length - CONTEXT_TOKEN_MAX_ENTRIES;
+    for (let i = 0; i < toRemove; i++) {
+      contextTokenCache.delete(entries[i]![0]);
+    }
+  }
+}
+
+function cacheContextToken(userId: string, token: string): void {
+  contextTokenCache.set(userId, { token, lastAccessed: Date.now() });
+  evictContextTokens();
+  saveContextTokens();
+}
+
+function getCachedContextToken(userId: string): string | undefined {
+  const entry = contextTokenCache.get(userId);
+  if (!entry) return undefined;
+  if (Date.now() - entry.lastAccessed > CONTEXT_TOKEN_TTL_MS) {
+    contextTokenCache.delete(userId);
+    return undefined;
+  }
+  entry.lastAccessed = Date.now();
+  return entry.token;
+}
+
+// ── Instance Lock ────────────────────────────────────────────────────────────
+
+const LOCK_STALE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+function getLockFileAge(lockFile: string): number {
+  try {
+    const stat = fs.statSync(lockFile);
+    return Date.now() - stat.mtimeMs;
+  } catch {
+    return Infinity;
+  }
+}
+
+function isLikelyWechatChannel(pid: number): boolean {
+  try {
+    const isWin = process.platform === "win32";
+    const cmd = isWin
+      ? `wmic process where "ProcessId=${pid}" get CommandLine /FORMAT:LIST 2>NUL`
+      : `cat /proc/${pid}/cmdline 2>/dev/null || ps -p ${pid} -o command= 2>/dev/null`;
+    const output = execSync(cmd, { encoding: "utf-8", timeout: 3000 });
+    return output.toLowerCase().includes("wechat-channel");
+  } catch {
+    // Cannot determine — assume it is to be safe
+    return true;
+  }
+}
+
+function acquireLock(): boolean {
+  const lockFile = getLockPidFile();
+  try {
+    fs.mkdirSync(getCredentialsDir(), { recursive: true });
+
+    // Use exclusive create to avoid TOCTOU race
+    try {
+      const fd = fs.openSync(lockFile, "wx");
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return true;
+    } catch (err: any) {
+      if (err.code === "EEXIST") {
+        // Lock file exists — check if the process is still alive
+        try {
+          const existingPid = parseInt(fs.readFileSync(lockFile, "utf-8").trim(), 10);
+          if (!isNaN(existingPid)) {
+            process.kill(existingPid, 0);
+
+            // Process is alive — check if the lock is stale (older than 10 min)
+            const age = getLockFileAge(lockFile);
+            if (age > LOCK_STALE_TIMEOUT_MS) {
+              log(`锁文件已过期 (${Math.round(age / 60_000)} 分钟前创建)，尝试清理...`);
+            } else if (isLikelyWechatChannel(existingPid)) {
+              // Process is alive, lock is fresh, and it looks like our process
+              logError(`另一个实例已在运行 (PID ${existingPid})，退出。`);
+              return false;
+            } else {
+              // Process is alive but doesn't look like wechat-channel (PID reused)
+              log(`PID ${existingPid} 存活但不是 wechat-channel 进程 (可能 PID 复用)，清理锁文件...`);
+            }
+          }
+        } catch {
+          // Process not running — stale lock, try to remove and retry
+        }
+        try {
+          fs.unlinkSync(lockFile);
+          const fd = fs.openSync(lockFile, "wx");
+          fs.writeSync(fd, String(process.pid));
+          fs.closeSync(fd);
+          log("清理过期锁文件并重新获取锁");
+          return true;
+        } catch {
+          logError("无法清理过期锁文件");
+          return false;
+        }
+      }
+      logError(`无法创建锁文件: ${String(err)}`);
+      return false;
+    }
+  } catch (err) {
+    logError(`无法获取锁文件: ${String(err)}`);
+    return false;
+  }
+}
+
+function releaseLock(): void {
+  try {
+    const lockFile = getLockPidFile();
+    if (fs.existsSync(lockFile)) {
+      const pid = fs.readFileSync(lockFile, "utf-8").trim();
+      if (pid === String(process.pid)) {
+        fs.unlinkSync(lockFile);
+      }
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+// ── Input Validation ─────────────────────────────────────────────────────────
+
+const DANGEROUS_CHARS = /[\x00-\x1f\x7f]/;
+
+function validateSenderId(senderId: string): boolean {
+  if (!senderId || typeof senderId !== "string") return false;
+  if (senderId.length > MAX_SENDER_ID_LENGTH) return false;
+  if (DANGEROUS_CHARS.test(senderId)) return false;
+  return true;
+}
+
+function truncateText(text: string, maxLen: number = MAX_REPLY_LENGTH): string {
+  if (text.length <= maxLen) return text;
+  log(`消息超长 (${text.length} 字符)，截断至 ${maxLen}`);
+  return text.slice(0, maxLen);
+}
+
+// ── Message Extraction ───────────────────────────────────────────────────────
+
 function extractTextFromMessage(msg: WeixinMessage): string {
   if (!msg.item_list?.length) return "";
   for (const item of msg.item_list) {
@@ -307,8 +316,20 @@ function extractTextFromMessage(msg: WeixinMessage): string {
       const text = item.text_item.text;
       const ref = item.ref_msg;
       if (!ref) return text;
+
       const parts: string[] = [];
       if (ref.title) parts.push(ref.title);
+
+      // Extract actual content from the referenced message
+      if (ref.message_item) {
+        const refItem = ref.message_item;
+        if (refItem.text_item?.text) {
+          parts.push(refItem.text_item.text);
+        } else if (refItem.voice_item?.text) {
+          parts.push(refItem.voice_item.text);
+        }
+      }
+
       if (!parts.length) return text;
       return `[引用: ${parts.join(" | ")}]\n${text}`;
     }
@@ -319,24 +340,13 @@ function extractTextFromMessage(msg: WeixinMessage): string {
   return "";
 }
 
-// ── Context Token Cache ──────────────────────────────────────────────────────
-
-const contextTokenCache = new Map<string, string>();
-
-function cacheContextToken(userId: string, token: string): void {
-  contextTokenCache.set(userId, token);
-}
-
-function getCachedContextToken(userId: string): string | undefined {
-  return contextTokenCache.get(userId);
-}
-
 // ── getUpdates / sendMessage ─────────────────────────────────────────────────
 
 async function getUpdates(
   baseUrl: string,
   token: string,
   getUpdatesBuf: string,
+  timeoutMs: number,
 ): Promise<GetUpdatesResp> {
   try {
     const raw = await apiFetch({
@@ -347,7 +357,7 @@ async function getUpdates(
         base_info: { channel_version: CHANNEL_VERSION },
       }),
       token,
-      timeoutMs: LONG_POLL_TIMEOUT_MS,
+      timeoutMs,
     });
     return JSON.parse(raw) as GetUpdatesResp;
   } catch (err) {
@@ -359,7 +369,7 @@ async function getUpdates(
 }
 
 function generateClientId(): string {
-  return `claude-code-wechat:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  return crypto.randomBytes(16).toString("hex");
 }
 
 async function sendTextMessage(
@@ -369,6 +379,7 @@ async function sendTextMessage(
   text: string,
   contextToken: string,
 ): Promise<string> {
+  const truncatedText = truncateText(text);
   const clientId = generateClientId();
   await apiFetch({
     baseUrl,
@@ -380,7 +391,7 @@ async function sendTextMessage(
         client_id: clientId,
         message_type: MSG_TYPE_BOT,
         message_state: MSG_STATE_FINISH,
-        item_list: [{ type: MSG_ITEM_TEXT, text_item: { text } }],
+        item_list: [{ type: MSG_ITEM_TEXT, text_item: { text: truncatedText } }],
         context_token: contextToken,
       },
       base_info: { channel_version: CHANNEL_VERSION },
@@ -389,6 +400,28 @@ async function sendTextMessage(
     timeoutMs: 15_000,
   });
   return clientId;
+}
+
+async function sendTextMessageWithRetry(
+  baseUrl: string,
+  token: string,
+  to: string,
+  text: string,
+  contextToken: string,
+): Promise<string> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= SEND_RETRY_COUNT; attempt++) {
+    try {
+      return await sendTextMessage(baseUrl, token, to, text, contextToken);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < SEND_RETRY_COUNT) {
+        log(`发送失败 (第 ${attempt + 1} 次)，${SEND_RETRY_DELAY_MS / 1000}s 后重试...`);
+        await new Promise((r) => setTimeout(r, SEND_RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastError;
 }
 
 // ── MCP Channel Server ──────────────────────────────────────────────────────
@@ -444,6 +477,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       sender_id: string;
       text: string;
     };
+
+    // P0 — Input validation
+    if (!validateSenderId(sender_id)) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "error: invalid sender_id format",
+          },
+        ],
+      };
+    }
+    if (!text || typeof text !== "string") {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "error: text is required and must be a string",
+          },
+        ],
+      };
+    }
+
     if (!activeAccount) {
       return {
         content: [{ type: "text" as const, text: "error: not logged in" }],
@@ -461,7 +517,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
     try {
-      await sendTextMessage(
+      await sendTextMessageWithRetry(
         activeAccount.baseUrl,
         activeAccount.token,
         sender_id,
@@ -470,6 +526,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       );
       return { content: [{ type: "text" as const, text: "sent" }] };
     } catch (err) {
+      logError(`发送回复失败: ${String(err)}`);
       return {
         content: [
           { type: "text" as const, text: `send failed: ${String(err)}` },
@@ -482,27 +539,88 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // ── Long-poll loop ──────────────────────────────────────────────────────────
 
+function computeBackoffMs(failures: number): number {
+  const base = Math.pow(2, failures) * 2000;
+  const jitter = Math.floor(Math.random() * 1000);
+  return Math.min(base + jitter, 60_000);
+}
+
+async function processMessages(msgs: WeixinMessage[] | undefined): Promise<void> {
+  for (const msg of msgs ?? []) {
+    // Only process user messages (not bot messages)
+    if (msg.message_type !== MSG_TYPE_USER) continue;
+
+    const text = extractTextFromMessage(msg);
+    if (!text) continue;
+
+    const senderId = msg.from_user_id ?? "unknown";
+
+    // Cache context token for reply
+    if (msg.context_token) {
+      cacheContextToken(senderId, msg.context_token);
+    }
+
+    log(`收到消息: from=${senderId} text=${text.slice(0, 50)}...`);
+
+    // Push to Claude Code session
+    try {
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: text,
+          meta: {
+            sender: senderId.split("@")[0] || senderId,
+            sender_id: senderId,
+          },
+        },
+      });
+    } catch (err) {
+      logError(`推送消息到 Claude Code 失败: ${String(err)}`);
+    }
+  }
+}
+
+async function handlePollError(
+  err: unknown,
+  consecutiveFailures: number,
+): Promise<number> {
+  consecutiveFailures++;
+  logError(`轮询异常: ${String(err)}`);
+  const delay = computeBackoffMs(consecutiveFailures);
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    logError(
+      `连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${delay / 1000}s`,
+    );
+  }
+  await new Promise((r) => setTimeout(r, delay));
+  return consecutiveFailures;
+}
+
 async function startPolling(account: AccountData): Promise<never> {
   const { baseUrl, token } = account;
   let getUpdatesBuf = "";
   let consecutiveFailures = 0;
+  let longPollTimeout = LONG_POLL_TIMEOUT_MS;
 
   // Load cached sync buf if available
-  const syncBufFile = path.join(CREDENTIALS_DIR, "sync_buf.txt");
+  const syncBufFile = getSyncBufFile();
   try {
     if (fs.existsSync(syncBufFile)) {
       getUpdatesBuf = fs.readFileSync(syncBufFile, "utf-8");
       log(`恢复上次同步状态 (${getUpdatesBuf.length} bytes)`);
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    log(`加载同步状态失败: ${String(err)}`);
   }
+
+  // Load persisted context tokens
+  loadContextTokens();
 
   log("开始监听微信消息...");
 
   while (true) {
     try {
-      const resp = await getUpdates(baseUrl, token, getUpdatesBuf);
+      const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
 
       // Handle API errors
       const isError =
@@ -513,68 +631,37 @@ async function startPolling(account: AccountData): Promise<never> {
         logError(
           `getUpdates 失败: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`,
         );
+        const delay = computeBackoffMs(consecutiveFailures);
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          logError(
-            `连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${BACKOFF_DELAY_MS / 1000}s`,
-          );
+          logError(`连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${delay / 1000}s`);
           consecutiveFailures = 0;
-          await new Promise((r) => setTimeout(r, BACKOFF_DELAY_MS));
-        } else {
-          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
         }
+        await new Promise((r) => setTimeout(r, delay));
         continue;
       }
 
       consecutiveFailures = 0;
 
-      // Save sync buf
+      // Adapt long-poll timeout from server
+      if (resp.longpolling_timeout_ms && resp.longpolling_timeout_ms >= LONG_POLL_TIMEOUT_MIN_MS && resp.longpolling_timeout_ms <= LONG_POLL_TIMEOUT_MAX_MS) {
+        longPollTimeout = resp.longpolling_timeout_ms;
+      }
+
+      // Process messages FIRST, then save sync buf
+      await processMessages(resp.msgs);
+
+      // Save sync buf AFTER successful message processing
       if (resp.get_updates_buf) {
         getUpdatesBuf = resp.get_updates_buf;
         try {
+          fs.mkdirSync(getCredentialsDir(), { recursive: true });
           fs.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
-        } catch {
-          // ignore
+        } catch (err) {
+          log(`保存同步状态失败: ${String(err)}`);
         }
-      }
-
-      // Process messages
-      for (const msg of resp.msgs ?? []) {
-        // Only process user messages (not bot messages)
-        if (msg.message_type !== MSG_TYPE_USER) continue;
-
-        const text = extractTextFromMessage(msg);
-        if (!text) continue;
-
-        const senderId = msg.from_user_id ?? "unknown";
-
-        // Cache context token for reply
-        if (msg.context_token) {
-          cacheContextToken(senderId, msg.context_token);
-        }
-
-        log(`收到消息: from=${senderId} text=${text.slice(0, 50)}...`);
-
-        // Push to Claude Code session
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: text,
-            meta: {
-              sender: senderId.split("@")[0] || senderId,
-              sender_id: senderId,
-            },
-          },
-        });
       }
     } catch (err) {
-      consecutiveFailures++;
-      logError(`轮询异常: ${String(err)}`);
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        consecutiveFailures = 0;
-        await new Promise((r) => setTimeout(r, BACKOFF_DELAY_MS));
-      } else {
-        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-      }
+      consecutiveFailures = await handlePollError(err, consecutiveFailures);
     }
   }
 }
@@ -582,6 +669,26 @@ async function startPolling(account: AccountData): Promise<never> {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // Acquire instance lock
+  if (!acquireLock()) {
+    process.exit(1);
+  }
+
+  // Cleanup on exit
+  const cleanup = () => {
+    releaseLock();
+    saveContextTokens();
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+
   // Connect MCP transport first (Claude Code expects stdio handshake)
   await mcp.connect(new StdioServerTransport());
   log("MCP 连接就绪");
@@ -591,7 +698,70 @@ async function main() {
 
   if (!account) {
     log("未找到已保存的凭据，启动微信扫码登录...");
-    account = await doQRLogin(DEFAULT_BASE_URL);
+
+    // Inline QR login flow (same as setup.ts but using shared helpers)
+    log("正在获取微信登录二维码...");
+    const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
+
+    log("\n请使用微信扫描以下二维码：\n");
+    try {
+      const qrterm = await import("qrcode-terminal");
+      await new Promise<void>((resolve) => {
+        qrterm.default.generate(
+          qrResp.qrcode_img_content,
+          { small: true },
+          (qr: string) => {
+            process.stderr.write(qr + "\n");
+            resolve();
+          },
+        );
+      });
+    } catch {
+      log(`二维码链接: ${qrResp.qrcode_img_content}`);
+    }
+
+    log("等待扫码...");
+    const deadline = Date.now() + 480_000;
+    let scannedPrinted = false;
+
+    while (Date.now() < deadline) {
+      const status = await pollQRStatus(DEFAULT_BASE_URL, qrResp.qrcode);
+
+      switch (status.status) {
+        case "wait":
+          break;
+        case "scaned":
+          if (!scannedPrinted) {
+            log("👀 已扫码，请在微信中确认...");
+            scannedPrinted = true;
+          }
+          break;
+        case "expired":
+          log("二维码已过期，请重新启动。");
+          process.exit(1);
+          break;
+        case "confirmed": {
+          if (!status.ilink_bot_id || !status.bot_token) {
+            logError("登录确认但未返回 bot 信息");
+            process.exit(1);
+          }
+          const confirmedAccount: AccountData = {
+            token: status.bot_token,
+            baseUrl: status.baseurl || DEFAULT_BASE_URL,
+            accountId: status.ilink_bot_id,
+            userId: status.ilink_user_id,
+            savedAt: new Date().toISOString(),
+          };
+          saveCredentials(confirmedAccount);
+          account = confirmedAccount;
+          log("✅ 微信连接成功！");
+          break;
+        }
+      }
+      if (account) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
     if (!account) {
       logError("登录失败，退出。");
       process.exit(1);
