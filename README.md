@@ -39,10 +39,10 @@ npx @liangrk/claude-code-wechatbot install
 
 ### 3. 启动 Claude Code + WeChat 通道
 
-在包含 `.mcp.json` 的目录下启动 Claude Code 即可，MCP server 会自动加载：
+在包含 `.mcp.json` 的目录下启动 Claude Code，MCP server 会自动加载：
 
 ```bash
-claude
+claude --dangerously-skip-permissions
 ```
 
 ### 4. 在微信中发消息

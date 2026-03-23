@@ -84,7 +84,7 @@ function install() {
   console.log(`
 Next steps:
   1. Run: npx claude-code-wechat-channel setup
-  2. Then: claude (in the same directory as .mcp.json)
+  2. Then: claude --dangerously-skip-permissions
 `);
 }
 

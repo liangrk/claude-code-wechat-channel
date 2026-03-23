@@ -1,10 +1,10 @@
 {
-  "name": "claude-code-wechat-channel",
-  "version": "0.2.0",
+  "name": "@liangrk/claude-code-wechatbot",
+  "version": "0.3.1",
   "description": "Claude Code Channel plugin for WeChat — bridge WeChat messages into Claude Code sessions via the official ilink API",
   "type": "module",
   "bin": {
-    "claude-code-wechat-channel": "./cli.mjs"
+    "claude-code-wechat-channel": "cli.mjs"
   },
   "files": [
     "cli.mjs",
@@ -14,6 +14,7 @@
   ],
   "scripts": {
     "build": "bun build wechat-channel.ts --target node --outfile dist/wechat-channel.js && bun build setup.ts --target node --outfile dist/setup.js",
+    "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -21,7 +22,8 @@
     "qrcode-terminal": "^0.12.0"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/node": "^25.5.0"
   },
   "engines": {
     "node": ">=18"
@@ -29,7 +31,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Johnixr/claude-code-wechat-channel.git"
+    "url": "git+https://github.com/liangrk/claude-code-wechat-channel.git"
   },
   "keywords": [
     "claude-code",
