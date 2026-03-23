@@ -27,6 +27,7 @@ import {
 import {
   type AccountData,
   DEFAULT_BASE_URL,
+  CHANNEL_VERSION,
   LONG_POLL_TIMEOUT_MS,
   loadCredentials,
   saveCredentials,
@@ -42,7 +43,6 @@ import {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const CHANNEL_NAME = "wechat";
-const CHANNEL_VERSION = "0.1.0";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_REPLY_LENGTH = 4096;
@@ -601,6 +601,7 @@ async function startPolling(account: AccountData): Promise<never> {
   let getUpdatesBuf = "";
   let consecutiveFailures = 0;
   let longPollTimeout = LONG_POLL_TIMEOUT_MS;
+  let emptyPollCount = 0;
 
   // Load cached sync buf if available
   const syncBufFile = getSyncBufFile();
@@ -616,6 +617,18 @@ async function startPolling(account: AccountData): Promise<never> {
   // Load persisted context tokens
   loadContextTokens();
 
+  // Log credential age
+  if (account.savedAt) {
+    try {
+      const ageMs = Date.now() - new Date(account.savedAt).getTime();
+      const ageHours = Math.round(ageMs / 3600_000);
+      log(`凭据保存于 ${account.savedAt}，距今 ${ageHours} 小时`);
+    } catch {
+      // ignore
+    }
+  }
+
+  log(`channel_version: ${CHANNEL_VERSION}`);
   log("开始监听微信消息...");
 
   while (true) {
@@ -627,6 +640,14 @@ async function startPolling(account: AccountData): Promise<never> {
         (resp.ret !== undefined && resp.ret !== 0) ||
         (resp.errcode !== undefined && resp.errcode !== 0);
       if (isError) {
+        // Session expired (errcode -14)
+        if (resp.ret === -14 || resp.errcode === -14) {
+          logError("会话已过期 (errcode -14)，请重新运行 setup 登录");
+          logError("1 小时后重试...");
+          await new Promise((r) => setTimeout(r, 3600_000));
+          continue;
+        }
+
         consecutiveFailures++;
         logError(
           `getUpdates 失败: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`,
@@ -648,7 +669,18 @@ async function startPolling(account: AccountData): Promise<never> {
       }
 
       // Process messages FIRST, then save sync buf
+      const msgCount = resp.msgs?.length ?? 0;
       await processMessages(resp.msgs);
+
+      // Heartbeat log every 10 empty polls (~5-6 min)
+      if (msgCount === 0) {
+        emptyPollCount++;
+        if (emptyPollCount % 10 === 0) {
+          log(`心跳: 长轮询正常 (已空轮询 ${emptyPollCount} 次)`);
+        }
+      } else {
+        emptyPollCount = 0;
+      }
 
       // Save sync buf AFTER successful message processing
       if (resp.get_updates_buf) {

@@ -36,6 +36,7 @@ export interface QRStatusResponse {
 export const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 export const BOT_TYPE = "3";
 export const LONG_POLL_TIMEOUT_MS = 35_000;
+export const CHANNEL_VERSION = "1.0.2";
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -70,8 +71,7 @@ export function loadCredentials(): AccountData | null {
     const file = getCredentialsFile();
     if (!fs.existsSync(file)) return null;
     return JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch (err) {
-    process.stderr.write(`[shared] WARNING: Failed to load credentials: ${String(err)}\n`);
+  } catch {
     return null;
   }
 }
@@ -180,5 +180,56 @@ export async function pollQRStatus(
       return { status: "wait" };
     }
     throw err;
+  }
+}
+
+// ── Ping API (connectivity test) ────────────────────────────────────────────
+
+export interface PingResult {
+  ok: boolean;
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  latencyMs?: number;
+  error?: string;
+}
+
+export async function pingApi(
+  baseUrl: string,
+  token: string,
+): Promise<PingResult> {
+  const start = Date.now();
+  try {
+    const raw = await apiFetch({
+      baseUrl,
+      endpoint: "ilink/bot/getupdates",
+      body: JSON.stringify({
+        get_updates_buf: "",
+        base_info: { channel_version: CHANNEL_VERSION },
+      }),
+      token,
+      timeoutMs: 10_000,
+    });
+    const resp = JSON.parse(raw) as {
+      ret?: number;
+      errcode?: number;
+      errmsg?: string;
+    };
+    const latency = Date.now() - start;
+    const isErr =
+      (resp.ret !== undefined && resp.ret !== 0) ||
+      (resp.errcode !== undefined && resp.errcode !== 0);
+    if (isErr) {
+      return {
+        ok: false,
+        ret: resp.ret,
+        errcode: resp.errcode,
+        errmsg: resp.errmsg,
+        latencyMs: latency,
+      };
+    }
+    return { ok: true, latencyMs: latency };
+  } catch (err) {
+    return { ok: false, error: String(err), latencyMs: Date.now() - start };
   }
 }

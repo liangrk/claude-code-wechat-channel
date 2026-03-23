@@ -21891,6 +21891,7 @@ import path from "node:path";
 var DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 var BOT_TYPE = "3";
 var LONG_POLL_TIMEOUT_MS = 35e3;
+var CHANNEL_VERSION = "1.0.2";
 function getHomeDir() {
   return os.homedir();
 }
@@ -22009,7 +22010,6 @@ async function pollQRStatus(baseUrl, qrcode) {
 
 // wechat-channel.ts
 var CHANNEL_NAME = "wechat";
-var CHANNEL_VERSION = "0.1.0";
 var MAX_CONSECUTIVE_FAILURES = 3;
 var MAX_REPLY_LENGTH = 4096;
 var MAX_SENDER_ID_LENGTH = 256;
@@ -22422,6 +22422,7 @@ async function startPolling(account) {
   let getUpdatesBuf = "";
   let consecutiveFailures = 0;
   let longPollTimeout = LONG_POLL_TIMEOUT_MS;
+  let emptyPollCount = 0;
   const syncBufFile = getSyncBufFile();
   try {
     if (fs2.existsSync(syncBufFile)) {
@@ -22432,12 +22433,27 @@ async function startPolling(account) {
     log(`\u52A0\u8F7D\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
   }
   loadContextTokens();
+  if (account.savedAt) {
+    try {
+      const ageMs = Date.now() - new Date(account.savedAt).getTime();
+      const ageHours = Math.round(ageMs / 36e5);
+      log(`\u51ED\u636E\u4FDD\u5B58\u4E8E ${account.savedAt}\uFF0C\u8DDD\u4ECA ${ageHours} \u5C0F\u65F6`);
+    } catch {
+    }
+  }
+  log(`channel_version: ${CHANNEL_VERSION}`);
   log("\u5F00\u59CB\u76D1\u542C\u5FAE\u4FE1\u6D88\u606F...");
   while (true) {
     try {
       const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
       const isError = resp.ret !== void 0 && resp.ret !== 0 || resp.errcode !== void 0 && resp.errcode !== 0;
       if (isError) {
+        if (resp.ret === -14 || resp.errcode === -14) {
+          logError("\u4F1A\u8BDD\u5DF2\u8FC7\u671F (errcode -14)\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C setup \u767B\u5F55");
+          logError("1 \u5C0F\u65F6\u540E\u91CD\u8BD5...");
+          await new Promise((r) => setTimeout(r, 36e5));
+          continue;
+        }
         consecutiveFailures++;
         logError(
           `getUpdates \u5931\u8D25: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`
@@ -22454,7 +22470,16 @@ async function startPolling(account) {
       if (resp.longpolling_timeout_ms && resp.longpolling_timeout_ms >= LONG_POLL_TIMEOUT_MIN_MS && resp.longpolling_timeout_ms <= LONG_POLL_TIMEOUT_MAX_MS) {
         longPollTimeout = resp.longpolling_timeout_ms;
       }
+      const msgCount = resp.msgs?.length ?? 0;
       await processMessages(resp.msgs);
+      if (msgCount === 0) {
+        emptyPollCount++;
+        if (emptyPollCount % 10 === 0) {
+          log(`\u5FC3\u8DF3: \u957F\u8F6E\u8BE2\u6B63\u5E38 (\u5DF2\u7A7A\u8F6E\u8BE2 ${emptyPollCount} \u6B21)`);
+        }
+      } else {
+        emptyPollCount = 0;
+      }
       if (resp.get_updates_buf) {
         getUpdatesBuf = resp.get_updates_buf;
         try {
