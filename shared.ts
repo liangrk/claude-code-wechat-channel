@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,12 +32,81 @@ export interface QRStatusResponse {
   ilink_user_id?: string;
 }
 
+// ── CDN & Media Types ────────────────────────────────────────────────────────
+
+export interface CDNMedia {
+  encrypt_query_param?: string;
+  aes_key?: string;
+  encrypt_type?: number;
+}
+
+export interface RefMessage {
+  message_item?: MessageItem;
+  title?: string;
+}
+
+export interface MessageItem {
+  type?: number;
+  text_item?: { text?: string };
+  voice_item?: { text?: string; media?: CDNMedia; encode_type?: number; playtime?: number };
+  image_item?: { media?: CDNMedia; thumb_media?: CDNMedia; aeskey?: string; url?: string };
+  file_item?: { media?: CDNMedia; file_name?: string; md5?: string; len?: string };
+  video_item?: { media?: CDNMedia; video_size?: number; play_length?: number };
+  ref_msg?: RefMessage;
+}
+
+// ── Upload URL Response ──────────────────────────────────────────────────────
+
+export interface UploadUrlResponse {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  upload_url?: string;
+  file_token?: string;
+  aes_key?: string;
+  encrypt_type?: number;
+  upload_size?: number;
+}
+
+export interface WeixinMessage {
+  from_user_id?: string;
+  to_user_id?: string;
+  client_id?: string;
+  session_id?: string;
+  message_type?: number;
+  message_state?: number;
+  item_list?: MessageItem[];
+  context_token?: string;
+  create_time_ms?: number;
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 export const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 export const BOT_TYPE = "3";
 export const LONG_POLL_TIMEOUT_MS = 35_000;
-export const CHANNEL_VERSION = "1.0.2";
+export const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+export const MSG_ITEM_TEXT = 1;
+export const MSG_ITEM_IMAGE = 2;
+export const MSG_ITEM_VOICE = 3;
+export const MSG_ITEM_FILE = 4;
+export const MSG_ITEM_VIDEO = 5;
+
+export function buildBaseInfo(): { channel_version: string } {
+  return { channel_version: CHANNEL_VERSION };
+}
+export function readChannelVersion(): string {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const pkgPath = path.resolve(dir, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as { version?: string };
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+export const CHANNEL_VERSION = readChannelVersion();
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -232,4 +302,24 @@ export async function pingApi(
   } catch (err) {
     return { ok: false, error: String(err), latencyMs: Date.now() - start };
   }
+}
+
+// ── Upload URL API ───────────────────────────────────────────────────────────
+
+export async function getUploadUrl(
+  baseUrl: string,
+  token: string,
+  params: { file_type: number; file_size: number; file_name?: string },
+): Promise<UploadUrlResponse> {
+  const raw = await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      base_info: buildBaseInfo(),
+      ...params,
+    }),
+    token,
+    timeoutMs: 15_000,
+  });
+  return JSON.parse(raw) as UploadUrlResponse;
 }

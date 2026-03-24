@@ -1102,8 +1102,20 @@ import fs2 from "node:fs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 var DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 var BOT_TYPE = "3";
+function readChannelVersion() {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const pkgPath = path.resolve(dir, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+var CHANNEL_VERSION = readChannelVersion();
 function getHomeDir() {
   return os.homedir();
 }

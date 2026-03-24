@@ -6785,12 +6785,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs3, exportName) {
+    function addFormats(ajv, list, fs4, exportName) {
       var _a2;
       var _b;
       (_a2 = (_b = ajv.opts.code).formats) !== null && _a2 !== void 0 ? _a2 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs3[f]);
+        ajv.addFormat(f, fs4[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -7869,8 +7869,8 @@ var require_main = __commonJS({
 });
 
 // wechat-channel.ts
-import crypto2 from "node:crypto";
-import fs2 from "node:fs";
+import crypto3 from "node:crypto";
+import fs3 from "node:fs";
 import process4 from "node:process";
 import { execSync } from "node:child_process";
 
@@ -21888,10 +21888,30 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 var DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 var BOT_TYPE = "3";
 var LONG_POLL_TIMEOUT_MS = 35e3;
-var CHANNEL_VERSION = "1.0.2";
+var CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+var MSG_ITEM_TEXT = 1;
+var MSG_ITEM_IMAGE = 2;
+var MSG_ITEM_VOICE = 3;
+var MSG_ITEM_FILE = 4;
+var MSG_ITEM_VIDEO = 5;
+function buildBaseInfo() {
+  return { channel_version: CHANNEL_VERSION };
+}
+function readChannelVersion() {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const pkgPath = path.resolve(dir, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+var CHANNEL_VERSION = readChannelVersion();
 function getHomeDir() {
   return os.homedir();
 }
@@ -22007,6 +22027,237 @@ async function pollQRStatus(baseUrl, qrcode) {
     throw err;
   }
 }
+async function getUploadUrl(baseUrl, token, params) {
+  const raw = await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      base_info: buildBaseInfo(),
+      ...params
+    }),
+    token,
+    timeoutMs: 15e3
+  });
+  return JSON.parse(raw);
+}
+
+// typing.ts
+var TYPING_TTL_MS = 24 * 60 * 60 * 1e3;
+var TYPING_BACKOFF_BASE_MS = 5e3;
+var TYPING_MAX_BACKOFF_MS = 3e4;
+var TypingManager = class {
+  tickets = /* @__PURE__ */ new Map();
+  timers = /* @__PURE__ */ new Map();
+  failCounts = /* @__PURE__ */ new Map();
+  config = { botId: "", token: "", baseUrl: "" };
+  configure(botId, token, baseUrl) {
+    this.config = { botId, token, baseUrl };
+  }
+  getTicket(senderId) {
+    const entry = this.tickets.get(senderId);
+    if (!entry) return void 0;
+    if (Date.now() > entry.expiresAt) {
+      this.tickets.delete(senderId);
+      return void 0;
+    }
+    return entry.ticket;
+  }
+  setTicket(senderId, ticket) {
+    this.tickets.set(senderId, { ticket, expiresAt: Date.now() + TYPING_TTL_MS });
+  }
+  getBackoffMs(senderId) {
+    const count = this.failCounts.get(senderId) ?? 0;
+    return Math.min(TYPING_BACKOFF_BASE_MS * Math.pow(2, count), TYPING_MAX_BACKOFF_MS);
+  }
+  async fetchConfig(senderId) {
+    try {
+      const raw = await apiFetch({
+        baseUrl: this.config.baseUrl,
+        endpoint: "ilink/bot/getconfig",
+        body: JSON.stringify({
+          base_info: buildBaseInfo(),
+          bot_id: this.config.botId,
+          user_id: senderId
+        }),
+        token: this.config.token,
+        timeoutMs: 1e4
+      });
+      const resp = JSON.parse(raw);
+      if (resp.typing_ticket) {
+        this.setTicket(senderId, resp.typing_ticket);
+        this.failCounts.set(senderId, 0);
+        return resp.typing_ticket;
+      }
+    } catch {
+    }
+    return null;
+  }
+  async sendTyping(senderId, status) {
+    if (!this.config.token) return;
+    if (status === 2) {
+      const timer = this.timers.get(senderId);
+      if (timer) {
+        clearInterval(timer);
+        this.timers.delete(senderId);
+      }
+    }
+    let ticket = this.getTicket(senderId);
+    if (!ticket) {
+      ticket = await this.fetchConfig(senderId);
+      if (!ticket) return;
+    }
+    try {
+      await apiFetch({
+        baseUrl: this.config.baseUrl,
+        endpoint: "ilink/bot/sendtyping",
+        body: JSON.stringify({
+          base_info: buildBaseInfo(),
+          typing_ticket: ticket,
+          status
+        }),
+        token: this.config.token,
+        timeoutMs: 5e3
+      });
+      this.failCounts.set(senderId, 0);
+    } catch {
+      const count = (this.failCounts.get(senderId) ?? 0) + 1;
+      this.failCounts.set(senderId, count);
+      if (count >= 3) {
+        this.tickets.delete(senderId);
+        this.failCounts.delete(senderId);
+      }
+    }
+  }
+  startKeepalive(senderId) {
+    const existing = this.timers.get(senderId);
+    if (existing) clearInterval(existing);
+    const intervalMs = this.getBackoffMs(senderId);
+    const timer = setInterval(() => {
+      this.sendTyping(senderId, 1);
+    }, intervalMs);
+    this.timers.set(senderId, timer);
+  }
+  stopKeepalive(senderId) {
+    const timer = this.timers.get(senderId);
+    if (timer) {
+      clearInterval(timer);
+      this.timers.delete(senderId);
+    }
+  }
+  stopAll() {
+    for (const timer of this.timers.values()) {
+      clearInterval(timer);
+    }
+    this.timers.clear();
+  }
+};
+
+// media.ts
+import crypto2 from "node:crypto";
+import fs2 from "node:fs";
+function pkcs7Pad(buf, blockSize = 16) {
+  const padLen = blockSize - buf.length % blockSize;
+  return Buffer.concat([buf, Buffer.alloc(padLen, padLen)]);
+}
+function pkcs7Unpad(buf) {
+  const padLen = buf[buf.length - 1];
+  if (padLen === 0 || padLen > 16) return buf;
+  for (let i = buf.length - padLen; i < buf.length; i++) {
+    if (buf[i] !== padLen) return buf;
+  }
+  return buf.subarray(0, buf.length - padLen);
+}
+function parseAesKey(aesKeyBase64) {
+  const decoded = Buffer.from(aesKeyBase64, "base64");
+  if (decoded.length === 16) return decoded;
+  const hexStr = decoded.toString("utf-8").trim();
+  if (/^[0-9a-fA-F]{32}$/.test(hexStr)) {
+    return Buffer.from(hexStr, "hex");
+  }
+  return decoded.subarray(0, 16);
+}
+function encryptAesEcb(plaintext, key) {
+  const padded = pkcs7Pad(plaintext);
+  const cipher = crypto2.createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(padded), cipher.final()]);
+}
+function decryptAesEcb(ciphertext, key) {
+  const decipher = crypto2.createDecipheriv("aes-128-ecb", key, null);
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return pkcs7Unpad(decrypted);
+}
+async function downloadAndDecryptBuffer(media) {
+  if (!media.encrypt_query_param || !media.aes_key) return null;
+  try {
+    const url2 = `${CDN_BASE_URL}?${media.encrypt_query_param}`;
+    const res = await fetch(url2);
+    if (!res.ok) return null;
+    const contentLength = parseInt(res.headers.get("content-length") ?? "0", 10);
+    if (contentLength > MAX_DOWNLOAD_SIZE) return null;
+    const arrayBuf = await res.arrayBuffer();
+    const encrypted = Buffer.from(arrayBuf);
+    if (encrypted.length > MAX_DOWNLOAD_SIZE) return null;
+    const key = parseAesKey(media.aes_key);
+    return decryptAesEcb(encrypted, key);
+  } catch {
+    return null;
+  }
+}
+async function uploadBufferToCdn(uploadUrl, encrypted) {
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    try {
+      const res = await fetch(uploadUrl, {
+        method: "POST",
+        body: encrypted,
+        headers: {
+          "Content-Type": "application/octet-stream"
+        }
+      });
+      if (res.ok) return true;
+    } catch {
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 1e3));
+      }
+    }
+  }
+  return false;
+}
+async function uploadMediaToCdn(baseUrl, token, params, plaintext) {
+  try {
+    const uploadInfo = await getUploadUrl(baseUrl, token, params);
+    if (!uploadInfo.upload_url || !uploadInfo.aes_key) {
+      return uploadInfo;
+    }
+    const key = parseAesKey(uploadInfo.aes_key);
+    const encrypted = encryptAesEcb(plaintext, key);
+    const success2 = await uploadBufferToCdn(uploadInfo.upload_url, encrypted);
+    if (!success2) return null;
+    return uploadInfo;
+  } catch {
+    return null;
+  }
+}
+var MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024;
+function readLocalFile(filePath) {
+  try {
+    const stat = fs2.statSync(filePath);
+    if (stat.size > MAX_DOWNLOAD_SIZE) {
+      process.stderr.write(`[media] File too large: ${filePath} (${stat.size} bytes)
+`);
+      return null;
+    }
+    if (stat.size === 0) {
+      process.stderr.write(`[media] File is empty: ${filePath}
+`);
+      return null;
+    }
+    return fs2.readFileSync(filePath);
+  } catch (err) {
+    process.stderr.write(`[media] Failed to read file ${filePath}: ${String(err)}
+`);
+    return null;
+  }
+}
 
 // wechat-channel.ts
 var CHANNEL_NAME = "wechat";
@@ -22028,16 +22279,14 @@ function logError(msg) {
 `);
 }
 var MSG_TYPE_USER = 1;
-var MSG_ITEM_TEXT = 1;
-var MSG_ITEM_VOICE = 3;
 var MSG_TYPE_BOT = 2;
 var MSG_STATE_FINISH = 2;
 var contextTokenCache = /* @__PURE__ */ new Map();
 function loadContextTokens() {
   try {
     const file2 = getContextTokensFile();
-    if (!fs2.existsSync(file2)) return;
-    const data = JSON.parse(fs2.readFileSync(file2, "utf-8"));
+    if (!fs3.existsSync(file2)) return;
+    const data = JSON.parse(fs3.readFileSync(file2, "utf-8"));
     const now = Date.now();
     for (const [key, entry] of Object.entries(data)) {
       if (now - entry.ts < CONTEXT_TOKEN_TTL_MS) {
@@ -22052,14 +22301,14 @@ function saveContextTokens() {
   try {
     const dir = getCredentialsDir();
     const file2 = getContextTokensFile();
-    fs2.mkdirSync(dir, { recursive: true });
+    fs3.mkdirSync(dir, { recursive: true });
     const data = {};
     for (const [key, entry] of contextTokenCache.entries()) {
       data[key] = { token: entry.token, ts: entry.lastAccessed };
     }
-    fs2.writeFileSync(file2, JSON.stringify(data), "utf-8");
+    fs3.writeFileSync(file2, JSON.stringify(data), "utf-8");
     try {
-      fs2.chmodSync(file2, 384);
+      fs3.chmodSync(file2, 384);
     } catch {
     }
   } catch {
@@ -22100,7 +22349,7 @@ function getCachedContextToken(userId) {
 var LOCK_STALE_TIMEOUT_MS = 10 * 60 * 1e3;
 function getLockFileAge(lockFile) {
   try {
-    const stat = fs2.statSync(lockFile);
+    const stat = fs3.statSync(lockFile);
     return Date.now() - stat.mtimeMs;
   } catch {
     return Infinity;
@@ -22119,16 +22368,16 @@ function isLikelyWechatChannel(pid) {
 function acquireLock() {
   const lockFile = getLockPidFile();
   try {
-    fs2.mkdirSync(getCredentialsDir(), { recursive: true });
+    fs3.mkdirSync(getCredentialsDir(), { recursive: true });
     try {
-      const fd = fs2.openSync(lockFile, "wx");
-      fs2.writeSync(fd, String(process4.pid));
-      fs2.closeSync(fd);
+      const fd = fs3.openSync(lockFile, "wx");
+      fs3.writeSync(fd, String(process4.pid));
+      fs3.closeSync(fd);
       return true;
     } catch (err) {
       if (err.code === "EEXIST") {
         try {
-          const existingPid = parseInt(fs2.readFileSync(lockFile, "utf-8").trim(), 10);
+          const existingPid = parseInt(fs3.readFileSync(lockFile, "utf-8").trim(), 10);
           if (!isNaN(existingPid)) {
             process4.kill(existingPid, 0);
             const age = getLockFileAge(lockFile);
@@ -22144,10 +22393,10 @@ function acquireLock() {
         } catch {
         }
         try {
-          fs2.unlinkSync(lockFile);
-          const fd = fs2.openSync(lockFile, "wx");
-          fs2.writeSync(fd, String(process4.pid));
-          fs2.closeSync(fd);
+          fs3.unlinkSync(lockFile);
+          const fd = fs3.openSync(lockFile, "wx");
+          fs3.writeSync(fd, String(process4.pid));
+          fs3.closeSync(fd);
           log("\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6\u5E76\u91CD\u65B0\u83B7\u53D6\u9501");
           return true;
         } catch {
@@ -22166,10 +22415,10 @@ function acquireLock() {
 function releaseLock() {
   try {
     const lockFile = getLockPidFile();
-    if (fs2.existsSync(lockFile)) {
-      const pid = fs2.readFileSync(lockFile, "utf-8").trim();
+    if (fs3.existsSync(lockFile)) {
+      const pid = fs3.readFileSync(lockFile, "utf-8").trim();
       if (pid === String(process4.pid)) {
-        fs2.unlinkSync(lockFile);
+        fs3.unlinkSync(lockFile);
       }
     }
   } catch {
@@ -22187,7 +22436,7 @@ function truncateText(text, maxLen = MAX_REPLY_LENGTH) {
   log(`\u6D88\u606F\u8D85\u957F (${text.length} \u5B57\u7B26)\uFF0C\u622A\u65AD\u81F3 ${maxLen}`);
   return text.slice(0, maxLen);
 }
-function extractTextFromMessage(msg) {
+async function extractContentFromMessage(msg) {
   if (!msg.item_list?.length) return "";
   for (const item of msg.item_list) {
     if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
@@ -22209,10 +22458,51 @@ function extractTextFromMessage(msg) {
 ${text}`;
     }
     if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
-      return item.voice_item.text;
+      return `[\u8BED\u97F3] ${item.voice_item.text}`;
+    }
+    if (item.type === MSG_ITEM_IMAGE && item.image_item?.media) {
+      const buf = await downloadAndDecryptBuffer(item.image_item.media);
+      if (buf) {
+        const MAX_IMAGE_SIZE = 512 * 1024;
+        if (buf.length > MAX_IMAGE_SIZE) {
+          return `[\u56FE\u7247] (\u56FE\u7247\u8FC7\u5927: ${(buf.length / 1024).toFixed(0)}KB\uFF0C\u5DF2\u8DF3\u8FC7)`;
+        }
+        const ext = detectImageExtension(buf);
+        const b64 = buf.toString("base64");
+        return `[\u56FE\u7247] data:image/${ext};base64,${b64}`;
+      }
+      return "[\u56FE\u7247] (\u65E0\u6CD5\u4E0B\u8F7D\u6216\u89E3\u5BC6)";
+    }
+    if (item.type === MSG_ITEM_FILE && item.file_item) {
+      const fi = item.file_item;
+      const parts = ["[\u6587\u4EF6]"];
+      if (fi.file_name) parts.push(`\u540D\u79F0: ${fi.file_name}`);
+      if (fi.len) parts.push(`\u5927\u5C0F: ${formatFileSize(fi.len)}`);
+      return parts.join(" ");
+    }
+    if (item.type === MSG_ITEM_VIDEO && item.video_item) {
+      const vi = item.video_item;
+      const parts = ["[\u89C6\u9891]"];
+      if (vi.video_size) parts.push(`\u5927\u5C0F: ${formatFileSize(String(vi.video_size))}`);
+      if (vi.play_length) parts.push(`\u65F6\u957F: ${vi.play_length}\u79D2`);
+      return parts.join(" ");
     }
   }
   return "";
+}
+function detectImageExtension(buf) {
+  if (buf[0] === 137 && buf[1] === 80) return "png";
+  if (buf[0] === 255 && buf[1] === 216) return "jpeg";
+  if (buf[0] === 71 && buf[1] === 73) return "gif";
+  if (buf[0] === 82 && buf[1] === 73) return "webp";
+  return "png";
+}
+function formatFileSize(sizeStr) {
+  const bytes = parseInt(sizeStr, 10);
+  if (isNaN(bytes)) return sizeStr;
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 async function getUpdates(baseUrl, token, getUpdatesBuf, timeoutMs) {
   try {
@@ -22221,7 +22511,7 @@ async function getUpdates(baseUrl, token, getUpdatesBuf, timeoutMs) {
       endpoint: "ilink/bot/getupdates",
       body: JSON.stringify({
         get_updates_buf: getUpdatesBuf,
-        base_info: { channel_version: CHANNEL_VERSION }
+        base_info: buildBaseInfo()
       }),
       token,
       timeoutMs
@@ -22235,7 +22525,7 @@ async function getUpdates(baseUrl, token, getUpdatesBuf, timeoutMs) {
   }
 }
 function generateClientId() {
-  return crypto2.randomBytes(16).toString("hex");
+  return `claude-wechat:${Date.now()}-${crypto3.randomBytes(4).toString("hex")}`;
 }
 async function sendTextMessage(baseUrl, token, to, text, contextToken) {
   const truncatedText = truncateText(text);
@@ -22253,7 +22543,7 @@ async function sendTextMessage(baseUrl, token, to, text, contextToken) {
         item_list: [{ type: MSG_ITEM_TEXT, text_item: { text: truncatedText } }],
         context_token: contextToken
       },
-      base_info: { channel_version: CHANNEL_VERSION }
+      base_info: buildBaseInfo()
     }),
     token,
     timeoutMs: 15e3
@@ -22286,9 +22576,11 @@ var mcp = new Server(
       `Messages from WeChat users arrive as <channel source="wechat" sender="..." sender_id="...">`,
       "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
       "Messages are from real WeChat users via the WeChat ClawBot interface.",
+      "Users may send text, voice (auto-transcribed), images (base64 data URI), files, and videos.",
       "Respond naturally in Chinese unless the user writes in another language.",
       "Keep replies concise \u2014 WeChat is a chat app, not an essay platform.",
-      "Strip markdown formatting (WeChat doesn't render it). Use plain text."
+      "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
+      "To send an image back, use the wechat_send_image tool with a local file path."
     ].join("\n")
   }
 );
@@ -22311,10 +22603,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ["sender_id", "text"]
       }
+    },
+    {
+      name: "wechat_send_image",
+      description: "Send an image back to the WeChat user by uploading a local file",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sender_id: {
+            type: "string",
+            description: "The sender_id from the inbound <channel> tag (xxx@im.wechat format)"
+          },
+          file_path: {
+            type: "string",
+            description: "Absolute path to a local image file (PNG, JPEG, GIF, or WebP)"
+          }
+        },
+        required: ["sender_id", "file_path"]
+      }
     }
   ]
 }));
 var activeAccount = null;
+var typingManager = new TypingManager();
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === "wechat_reply") {
     const { sender_id, text } = req.params.arguments;
@@ -22355,6 +22666,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
     try {
+      await typingManager.sendTyping(sender_id, 2);
       await sendTextMessageWithRetry(
         activeAccount.baseUrl,
         activeAccount.token,
@@ -22372,6 +22684,102 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
   }
+  if (req.params.name === "wechat_send_image") {
+    const { sender_id, file_path } = req.params.arguments;
+    if (!validateSenderId(sender_id)) {
+      return {
+        content: [
+          { type: "text", text: "error: invalid sender_id format" }
+        ]
+      };
+    }
+    if (!file_path || typeof file_path !== "string") {
+      return {
+        content: [
+          { type: "text", text: "error: file_path is required and must be a string" }
+        ]
+      };
+    }
+    if (!activeAccount) {
+      return {
+        content: [{ type: "text", text: "error: not logged in" }]
+      };
+    }
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`
+          }
+        ]
+      };
+    }
+    try {
+      await typingManager.sendTyping(sender_id, 2);
+      const buf = readLocalFile(file_path);
+      if (!buf) {
+        const displayName = file_path.split(/[\\/]/).pop() ?? file_path;
+        return {
+          content: [
+            { type: "text", text: `error: cannot read file: ${displayName}` }
+          ]
+        };
+      }
+      const ext = detectImageExtension(buf);
+      const fileName = file_path.split(/[\\/]/).pop() || `image.${ext}`;
+      const uploadResult = await uploadMediaToCdn(
+        activeAccount.baseUrl,
+        activeAccount.token,
+        { file_type: 2, file_size: buf.length, file_name: fileName },
+        buf
+      );
+      if (!uploadResult?.file_token) {
+        return {
+          content: [
+            { type: "text", text: "error: upload failed \u2014 no file_token returned" }
+          ]
+        };
+      }
+      const clientId = generateClientId();
+      await apiFetch({
+        baseUrl: activeAccount.baseUrl,
+        endpoint: "ilink/bot/sendmessage",
+        body: JSON.stringify({
+          msg: {
+            from_user_id: "",
+            to_user_id: sender_id,
+            client_id: clientId,
+            message_type: MSG_TYPE_BOT,
+            message_state: MSG_STATE_FINISH,
+            item_list: [
+              {
+                type: MSG_ITEM_IMAGE,
+                image_item: {
+                  file_token: uploadResult.file_token,
+                  aeskey: uploadResult.aes_key,
+                  encrypt_type: uploadResult.encrypt_type ?? 1
+                }
+              }
+            ],
+            context_token: contextToken
+          },
+          base_info: buildBaseInfo()
+        }),
+        token: activeAccount.token,
+        timeoutMs: 3e4
+      });
+      return { content: [{ type: "text", text: "image sent" }] };
+    } catch (err) {
+      logError(`\u53D1\u9001\u56FE\u7247\u5931\u8D25: ${String(err)}`);
+      return {
+        content: [
+          { type: "text", text: `send image failed: ${String(err)}` }
+        ]
+      };
+    }
+  }
   throw new Error(`unknown tool: ${req.params.name}`);
 });
 function computeBackoffMs(failures) {
@@ -22382,18 +22790,26 @@ function computeBackoffMs(failures) {
 async function processMessages(msgs) {
   for (const msg of msgs ?? []) {
     if (msg.message_type !== MSG_TYPE_USER) continue;
-    const text = extractTextFromMessage(msg);
-    if (!text) continue;
     const senderId = msg.from_user_id ?? "unknown";
     if (msg.context_token) {
       cacheContextToken(senderId, msg.context_token);
     }
-    log(`\u6536\u5230\u6D88\u606F: from=${senderId} text=${text.slice(0, 50)}...`);
+    await typingManager.sendTyping(senderId, 1);
+    typingManager.startKeepalive(senderId);
+    const content = await extractContentFromMessage(msg);
+    if (!content) {
+      const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
+      log(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${types}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
+      await typingManager.sendTyping(senderId, 2);
+      typingManager.stopKeepalive(senderId);
+      continue;
+    }
+    log(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
     try {
       await mcp.notification({
         method: "notifications/claude/channel",
         params: {
-          content: text,
+          content,
           meta: {
             sender: senderId.split("@")[0] || senderId,
             sender_id: senderId
@@ -22425,8 +22841,8 @@ async function startPolling(account) {
   let emptyPollCount = 0;
   const syncBufFile = getSyncBufFile();
   try {
-    if (fs2.existsSync(syncBufFile)) {
-      getUpdatesBuf = fs2.readFileSync(syncBufFile, "utf-8");
+    if (fs3.existsSync(syncBufFile)) {
+      getUpdatesBuf = fs3.readFileSync(syncBufFile, "utf-8");
       log(`\u6062\u590D\u4E0A\u6B21\u540C\u6B65\u72B6\u6001 (${getUpdatesBuf.length} bytes)`);
     }
   } catch (err) {
@@ -22446,6 +22862,8 @@ async function startPolling(account) {
   while (true) {
     try {
       const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
+      const msgCount = resp.msgs?.length ?? 0;
+      log(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
       const isError = resp.ret !== void 0 && resp.ret !== 0 || resp.errcode !== void 0 && resp.errcode !== 0;
       if (isError) {
         if (resp.ret === -14 || resp.errcode === -14) {
@@ -22470,7 +22888,6 @@ async function startPolling(account) {
       if (resp.longpolling_timeout_ms && resp.longpolling_timeout_ms >= LONG_POLL_TIMEOUT_MIN_MS && resp.longpolling_timeout_ms <= LONG_POLL_TIMEOUT_MAX_MS) {
         longPollTimeout = resp.longpolling_timeout_ms;
       }
-      const msgCount = resp.msgs?.length ?? 0;
       await processMessages(resp.msgs);
       if (msgCount === 0) {
         emptyPollCount++;
@@ -22481,10 +22898,14 @@ async function startPolling(account) {
         emptyPollCount = 0;
       }
       if (resp.get_updates_buf) {
+        const oldLen = getUpdatesBuf.length;
         getUpdatesBuf = resp.get_updates_buf;
+        if (oldLen !== getUpdatesBuf.length) {
+          log(`sync_buf \u66F4\u65B0: ${oldLen}b \u2192 ${getUpdatesBuf.length}b`);
+        }
         try {
-          fs2.mkdirSync(getCredentialsDir(), { recursive: true });
-          fs2.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
+          fs3.mkdirSync(getCredentialsDir(), { recursive: true });
+          fs3.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
         } catch (err) {
           log(`\u4FDD\u5B58\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
         }
@@ -22499,6 +22920,7 @@ async function main() {
     process4.exit(1);
   }
   const cleanup = () => {
+    typingManager.stopAll();
     releaseLock();
     saveContextTokens();
   };
@@ -22581,6 +23003,7 @@ async function main() {
     log(`\u4F7F\u7528\u5DF2\u4FDD\u5B58\u8D26\u53F7: ${account.accountId}`);
   }
   activeAccount = account;
+  typingManager.configure(account.accountId, account.token, account.baseUrl);
   await startPolling(account);
 }
 main().catch((err) => {

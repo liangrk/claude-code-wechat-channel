@@ -26,9 +26,18 @@ import {
 
 import {
   type AccountData,
+  type CDNMedia,
+  type MessageItem,
+  type WeixinMessage,
   DEFAULT_BASE_URL,
   CHANNEL_VERSION,
   LONG_POLL_TIMEOUT_MS,
+  MSG_ITEM_TEXT,
+  MSG_ITEM_IMAGE,
+  MSG_ITEM_VOICE,
+  MSG_ITEM_FILE,
+  MSG_ITEM_VIDEO,
+  buildBaseInfo,
   loadCredentials,
   saveCredentials,
   getCredentialsDir,
@@ -39,6 +48,8 @@ import {
   fetchQRCode,
   pollQRStatus,
 } from "./shared.js";
+import { TypingManager } from "./typing.js";
+import { downloadAndDecryptBuffer, uploadMediaToCdn, readLocalFile } from "./media.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -66,35 +77,7 @@ function logError(msg: string) {
 
 // ── WeChat Message Types ─────────────────────────────────────────────────────
 
-interface TextItem {
-  text?: string;
-}
-
-interface RefMessage {
-  message_item?: MessageItem;
-  title?: string;
-}
-
-interface MessageItem {
-  type?: number;
-  text_item?: TextItem;
-  voice_item?: { text?: string };
-  ref_msg?: RefMessage;
-}
-
-interface WeixinMessage {
-  from_user_id?: string;
-  to_user_id?: string;
-  client_id?: string;
-  session_id?: string;
-  message_type?: number;
-  message_state?: number;
-  item_list?: MessageItem[];
-  context_token?: string;
-  create_time_ms?: number;
-}
-
-interface GetUpdatesResp {
+export interface GetUpdatesResp {
   ret?: number;
   errcode?: number;
   errmsg?: string;
@@ -105,8 +88,6 @@ interface GetUpdatesResp {
 
 // Message type constants
 const MSG_TYPE_USER = 1;
-const MSG_ITEM_TEXT = 1;
-const MSG_ITEM_VOICE = 3;
 const MSG_TYPE_BOT = 2;
 const MSG_STATE_FINISH = 2;
 
@@ -309,9 +290,15 @@ function truncateText(text: string, maxLen: number = MAX_REPLY_LENGTH): string {
 
 // ── Message Extraction ───────────────────────────────────────────────────────
 
-function extractTextFromMessage(msg: WeixinMessage): string {
+/**
+ * Extract content from a WeChat message. Handles text, voice, image, file, and video.
+ * Returns a string suitable for sending to Claude Code.
+ */
+async function extractContentFromMessage(msg: WeixinMessage): Promise<string> {
   if (!msg.item_list?.length) return "";
+
   for (const item of msg.item_list) {
+    // Text message
     if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
       const text = item.text_item.text;
       const ref = item.ref_msg;
@@ -320,7 +307,6 @@ function extractTextFromMessage(msg: WeixinMessage): string {
       const parts: string[] = [];
       if (ref.title) parts.push(ref.title);
 
-      // Extract actual content from the referenced message
       if (ref.message_item) {
         const refItem = ref.message_item;
         if (refItem.text_item?.text) {
@@ -333,11 +319,62 @@ function extractTextFromMessage(msg: WeixinMessage): string {
       if (!parts.length) return text;
       return `[引用: ${parts.join(" | ")}]\n${text}`;
     }
+
+    // Voice message (transcribed text)
     if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
-      return item.voice_item.text;
+      return `[语音] ${item.voice_item.text}`;
+    }
+
+    // Image message — download, decrypt, and send as base64 data URI
+    if (item.type === MSG_ITEM_IMAGE && item.image_item?.media) {
+      const buf = await downloadAndDecryptBuffer(item.image_item.media);
+      if (buf) {
+        const MAX_IMAGE_SIZE = 512 * 1024; // 512 KB
+        if (buf.length > MAX_IMAGE_SIZE) {
+          return `[图片] (图片过大: ${(buf.length / 1024).toFixed(0)}KB，已跳过)`;
+        }
+        const ext = detectImageExtension(buf);
+        const b64 = buf.toString("base64");
+        return `[图片] data:image/${ext};base64,${b64}`;
+      }
+      return "[图片] (无法下载或解密)";
+    }
+
+    // File message — show filename and size
+    if (item.type === MSG_ITEM_FILE && item.file_item) {
+      const fi = item.file_item;
+      const parts: string[] = ["[文件]"];
+      if (fi.file_name) parts.push(`名称: ${fi.file_name}`);
+      if (fi.len) parts.push(`大小: ${formatFileSize(fi.len)}`);
+      return parts.join(" ");
+    }
+
+    // Video message — show metadata
+    if (item.type === MSG_ITEM_VIDEO && item.video_item) {
+      const vi = item.video_item;
+      const parts: string[] = ["[视频]"];
+      if (vi.video_size) parts.push(`大小: ${formatFileSize(String(vi.video_size))}`);
+      if (vi.play_length) parts.push(`时长: ${vi.play_length}秒`);
+      return parts.join(" ");
     }
   }
   return "";
+}
+
+function detectImageExtension(buf: Buffer): string {
+  if (buf[0] === 0x89 && buf[1] === 0x50) return "png";
+  if (buf[0] === 0xFF && buf[1] === 0xD8) return "jpeg";
+  if (buf[0] === 0x47 && buf[1] === 0x49) return "gif";
+  if (buf[0] === 0x52 && buf[1] === 0x49) return "webp";
+  return "png";
+}
+
+function formatFileSize(sizeStr: string): string {
+  const bytes = parseInt(sizeStr, 10);
+  if (isNaN(bytes)) return sizeStr;
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 // ── getUpdates / sendMessage ─────────────────────────────────────────────────
@@ -354,7 +391,7 @@ async function getUpdates(
       endpoint: "ilink/bot/getupdates",
       body: JSON.stringify({
         get_updates_buf: getUpdatesBuf,
-        base_info: { channel_version: CHANNEL_VERSION },
+        base_info: buildBaseInfo(),
       }),
       token,
       timeoutMs,
@@ -369,7 +406,7 @@ async function getUpdates(
 }
 
 function generateClientId(): string {
-  return crypto.randomBytes(16).toString("hex");
+  return `claude-wechat:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
 async function sendTextMessage(
@@ -394,7 +431,7 @@ async function sendTextMessage(
         item_list: [{ type: MSG_ITEM_TEXT, text_item: { text: truncatedText } }],
         context_token: contextToken,
       },
-      base_info: { channel_version: CHANNEL_VERSION },
+      base_info: buildBaseInfo(),
     }),
     token,
     timeoutMs: 15_000,
@@ -437,9 +474,11 @@ const mcp = new Server(
       `Messages from WeChat users arrive as <channel source="wechat" sender="..." sender_id="...">`,
       "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
       "Messages are from real WeChat users via the WeChat ClawBot interface.",
+      "Users may send text, voice (auto-transcribed), images (base64 data URI), files, and videos.",
       "Respond naturally in Chinese unless the user writes in another language.",
       "Keep replies concise — WeChat is a chat app, not an essay platform.",
       "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
+      "To send an image back, use the wechat_send_image tool with a local file path.",
     ].join("\n"),
   },
 );
@@ -466,10 +505,30 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["sender_id", "text"],
       },
     },
+    {
+      name: "wechat_send_image",
+      description: "Send an image back to the WeChat user by uploading a local file",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          sender_id: {
+            type: "string",
+            description:
+              "The sender_id from the inbound <channel> tag (xxx@im.wechat format)",
+          },
+          file_path: {
+            type: "string",
+            description: "Absolute path to a local image file (PNG, JPEG, GIF, or WebP)",
+          },
+        },
+        required: ["sender_id", "file_path"],
+      },
+    },
   ],
 }));
 
 let activeAccount: AccountData | null = null;
+const typingManager = new TypingManager();
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === "wechat_reply") {
@@ -517,6 +576,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
     try {
+      // Cancel typing indicator on reply
+      await typingManager.sendTyping(sender_id, 2);
       await sendTextMessageWithRetry(
         activeAccount.baseUrl,
         activeAccount.token,
@@ -534,6 +595,117 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
   }
+
+  if (req.params.name === "wechat_send_image") {
+    const { sender_id, file_path } = req.params.arguments as {
+      sender_id: string;
+      file_path: string;
+    };
+
+    if (!validateSenderId(sender_id)) {
+      return {
+        content: [
+          { type: "text" as const, text: "error: invalid sender_id format" },
+        ],
+      };
+    }
+    if (!file_path || typeof file_path !== "string") {
+      return {
+        content: [
+          { type: "text" as const, text: "error: file_path is required and must be a string" },
+        ],
+      };
+    }
+
+    if (!activeAccount) {
+      return {
+        content: [{ type: "text" as const, text: "error: not logged in" }],
+      };
+    }
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`,
+          },
+        ],
+      };
+    }
+
+    try {
+      // Cancel typing on send
+      await typingManager.sendTyping(sender_id, 2);
+
+      const buf = readLocalFile(file_path);
+      if (!buf) {
+        const displayName = file_path.split(/[\\/]/).pop() ?? file_path;
+        return {
+          content: [
+            { type: "text" as const, text: `error: cannot read file: ${displayName}` },
+          ],
+        };
+      }
+
+      const ext = detectImageExtension(buf);
+      const fileName = file_path.split(/[\\/]/).pop() || `image.${ext}`;
+
+      const uploadResult = await uploadMediaToCdn(
+        activeAccount.baseUrl,
+        activeAccount.token,
+        { file_type: 2, file_size: buf.length, file_name: fileName },
+        buf,
+      );
+
+      if (!uploadResult?.file_token) {
+        return {
+          content: [
+            { type: "text" as const, text: "error: upload failed — no file_token returned" },
+          ],
+        };
+      }
+
+      const clientId = generateClientId();
+      await apiFetch({
+        baseUrl: activeAccount.baseUrl,
+        endpoint: "ilink/bot/sendmessage",
+        body: JSON.stringify({
+          msg: {
+            from_user_id: "",
+            to_user_id: sender_id,
+            client_id: clientId,
+            message_type: MSG_TYPE_BOT,
+            message_state: MSG_STATE_FINISH,
+            item_list: [
+              {
+                type: MSG_ITEM_IMAGE,
+                image_item: {
+                  file_token: uploadResult.file_token,
+                  aeskey: uploadResult.aes_key,
+                  encrypt_type: uploadResult.encrypt_type ?? 1,
+                },
+              },
+            ],
+            context_token: contextToken,
+          },
+          base_info: buildBaseInfo(),
+        }),
+        token: activeAccount.token,
+        timeoutMs: 30_000,
+      });
+
+      return { content: [{ type: "text" as const, text: "image sent" }] };
+    } catch (err) {
+      logError(`发送图片失败: ${String(err)}`);
+      return {
+        content: [
+          { type: "text" as const, text: `send image failed: ${String(err)}` },
+        ],
+      };
+    }
+  }
+
   throw new Error(`unknown tool: ${req.params.name}`);
 });
 
@@ -550,9 +722,6 @@ async function processMessages(msgs: WeixinMessage[] | undefined): Promise<void>
     // Only process user messages (not bot messages)
     if (msg.message_type !== MSG_TYPE_USER) continue;
 
-    const text = extractTextFromMessage(msg);
-    if (!text) continue;
-
     const senderId = msg.from_user_id ?? "unknown";
 
     // Cache context token for reply
@@ -560,14 +729,27 @@ async function processMessages(msgs: WeixinMessage[] | undefined): Promise<void>
       cacheContextToken(senderId, msg.context_token);
     }
 
-    log(`收到消息: from=${senderId} text=${text.slice(0, 50)}...`);
+    // Send typing indicator (start)
+    await typingManager.sendTyping(senderId, 1);
+    typingManager.startKeepalive(senderId);
+
+    const content = await extractContentFromMessage(msg);
+    if (!content) {
+      const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
+      log(`过滤消息: from=${senderId} item_types=[${types}] (无可用内容)`);
+      await typingManager.sendTyping(senderId, 2);
+      typingManager.stopKeepalive(senderId);
+      continue;
+    }
+
+    log(`收到消息: from=${senderId} content=${content.slice(0, 80)}...`);
 
     // Push to Claude Code session
     try {
       await mcp.notification({
         method: "notifications/claude/channel",
         params: {
-          content: text,
+          content,
           meta: {
             sender: senderId.split("@")[0] || senderId,
             sender_id: senderId,
@@ -635,6 +817,10 @@ async function startPolling(account: AccountData): Promise<never> {
     try {
       const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
 
+      // Diagnostic logging
+      const msgCount = resp.msgs?.length ?? 0;
+      log(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
+
       // Handle API errors
       const isError =
         (resp.ret !== undefined && resp.ret !== 0) ||
@@ -669,7 +855,6 @@ async function startPolling(account: AccountData): Promise<never> {
       }
 
       // Process messages FIRST, then save sync buf
-      const msgCount = resp.msgs?.length ?? 0;
       await processMessages(resp.msgs);
 
       // Heartbeat log every 10 empty polls (~5-6 min)
@@ -684,7 +869,11 @@ async function startPolling(account: AccountData): Promise<never> {
 
       // Save sync buf AFTER successful message processing
       if (resp.get_updates_buf) {
+        const oldLen = getUpdatesBuf.length;
         getUpdatesBuf = resp.get_updates_buf;
+        if (oldLen !== getUpdatesBuf.length) {
+          log(`sync_buf 更新: ${oldLen}b → ${getUpdatesBuf.length}b`);
+        }
         try {
           fs.mkdirSync(getCredentialsDir(), { recursive: true });
           fs.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
@@ -708,6 +897,7 @@ async function main() {
 
   // Cleanup on exit
   const cleanup = () => {
+    typingManager.stopAll();
     releaseLock();
     saveContextTokens();
   };
@@ -803,6 +993,7 @@ async function main() {
   }
 
   activeAccount = account;
+  typingManager.configure(account.accountId, account.token, account.baseUrl);
 
   // Start long-poll (runs forever)
   await startPolling(account);

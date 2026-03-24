@@ -13,6 +13,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { existsSync, writeFileSync, readFileSync, renameSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -102,9 +103,22 @@ async function status() {
   console.log("");
   console.log("Testing API connectivity...");
 
+  // Read channel version from package.json (same logic as shared.ts)
+  let channelVersion = "unknown";
+  try {
+    const pkgPath = resolve(__dirname, "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    channelVersion = pkg.version || "unknown";
+  } catch {
+    // fallback
+  }
+
+  const uint32 = randomBytes(4).readUInt32BE(0);
+  const wechatUin = Buffer.from(String(uint32), "utf-8").toString("base64");
+
   const body = JSON.stringify({
     get_updates_buf: "",
-    base_info: { channel_version: "1.0.2" },
+    base_info: { channel_version: channelVersion },
   });
 
   const base = (account.baseUrl || "https://ilinkai.weixin.qq.com").replace(/\/$/, "") + "/";
@@ -117,6 +131,7 @@ async function status() {
       headers: {
         "Content-Type": "application/json",
         AuthorizationType: "ilink_bot_token",
+        "X-WECHAT-UIN": wechatUin,
         Authorization: `Bearer ${account.token}`,
       },
       body,

@@ -7,9 +7,9 @@
 ## 工作原理
 
 ```
-微信 (iOS) → WeChat ClawBot → ilink API → [本插件] → Claude Code Session
-                                                  ↕
-Claude Code ← MCP Channel Protocol ← wechat_reply tool
+微信 (iOS/Android) → WeChat ClawBot → ilink API → [本插件] → Claude Code Session
+                                                       ↕
+Claude Code ← MCP Channel Protocol ← wechat_reply / wechat_send_image tool
 ```
 
 ## 前置要求
@@ -17,7 +17,7 @@ Claude Code ← MCP Channel Protocol ← wechat_reply tool
 - [Node.js](https://nodejs.org) >= 18（或 [Bun](https://bun.sh) >= 1.0）
 - [Claude Code](https://claude.com/claude-code) >= 2.1.80
 - claude.ai 账号登录或 API key（`ANTHROPIC_API_KEY`）
-- 微信 iOS 最新版（需支持 ClawBot 插件）
+- 微信 iOS 或 Android 最新版（需支持 ClawBot 插件）
 
 ## 快速开始
 
@@ -54,8 +54,9 @@ claude --dangerously-skip-permissions
 | 命令 | 说明 |
 |------|------|
 | `npx @liangrk/claude-code-wechatbot setup` | 微信扫码登录 |
-| `npx @liangrk/claude-code-wechatbot install` | 生成 .mcp.json 配置 |
 | `npx @liangrk/claude-code-wechatbot start` | 启动 MCP Channel 服务器 |
+| `npx @liangrk/claude-code-wechatbot status` | 检查账号和 API 连接状态 |
+| `npx @liangrk/claude-code-wechatbot install` | 生成 .mcp.json 配置 |
 | `npx @liangrk/claude-code-wechatbot help` | 显示帮助 |
 
 ## 安装
@@ -72,7 +73,7 @@ npm install -g @liangrk/claude-code-wechatbot
 - **消息发送**: 通过 `ilink/bot/sendmessage` 发送回复
 - **认证**: 使用 `ilink/bot/get_bot_qrcode` QR 码登录获取 Bearer Token
 - **协议**: 基于 MCP (Model Context Protocol) 的 Channel 扩展
-- **支持消息类型**: 文本消息、语音消息（自动转文字）
+- **支持消息类型**: 文本消息、语音消息（自动转文字）、图片消息、文件消息、视频消息
 - **错误恢复**: 连续失败 3 次后指数退避，最大 60s
 - **实例锁**: 防止多个实例同时运行
 
@@ -80,7 +81,7 @@ npm install -g @liangrk/claude-code-wechatbot
 
 - Claude Code 会自动加载 `.mcp.json` 中的 MCP server 配置
 - Claude Code 会话关闭后通道也会断开
-- 微信 ClawBot 目前仅支持 iOS 最新版
+- 微信 ClawBot 支持 iOS 和 Android（逐步开放中）
 - 每个 ClawBot 只能连接一个 agent 实例
 - 微信不支持 Markdown 渲染，回复会自动转为纯文本
 
