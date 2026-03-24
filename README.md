@@ -33,12 +33,22 @@ Claude Code ← MCP Channel Protocol ← wechat_reply / wechat_send_image tool
 
 适用于使用 API key（包括第三方如 GLM/智谱）的用户，不需要 Claude Code OAuth 登录。
 
-```bash
-# 1. 微信扫码登录
-npx @liangrk/claude-code-wechatbot setup
+**已发布版本（npm）：**
 
-# 2. 启动独立 Bot
+```bash
+npx @liangrk/claude-code-wechatbot setup
 npx @liangrk/claude-code-wechatbot bot
+```
+
+**未发布版本（本地源码）：**
+
+```bash
+git clone https://github.com/liangrk/claude-code-wechat-channel.git
+cd claude-code-wechat-channel
+npm install
+npm run build
+node cli.mjs setup
+node cli.mjs bot
 ```
 
 打开微信，找到 ClawBot 对话，发送消息即可与 Claude Code 对话。
@@ -56,7 +66,11 @@ npx @liangrk/claude-code-wechatbot bot
 #### 1. 微信扫码登录
 
 ```bash
+# 已发布版本
 npx @liangrk/claude-code-wechatbot setup
+
+# 未发布版本（本地源码）
+node cli.mjs setup
 ```
 
 终端会显示二维码，用微信扫描并确认。凭据保存到 `~/.claude/channels/wechat/account.json`。
@@ -64,7 +78,10 @@ npx @liangrk/claude-code-wechatbot setup
 #### 2. 生成 MCP 配置
 
 ```bash
+# 已发布版本
 npx @liangrk/claude-code-wechatbot install
+
+# 未发布版本（本地源码）— 手动创建 .mcp.json，见下方"从源码运行"章节
 ```
 
 这会在当前目录生成（或更新） `.mcp.json`，指向本插件。
@@ -129,6 +146,8 @@ claude --dangerously-load-development-channels server:wechat
 
 ## 命令说明
 
+### npm 发布版本
+
 | 命令 | 说明 |
 |------|------|
 | `npx @liangrk/claude-code-wechatbot setup` | 微信扫码登录 |
@@ -137,6 +156,16 @@ claude --dangerously-load-development-channels server:wechat
 | `npx @liangrk/claude-code-wechatbot status` | 检查账号和 API 连接状态 |
 | `npx @liangrk/claude-code-wechatbot install` | 生成 .mcp.json 配置 |
 | `npx @liangrk/claude-code-wechatbot help` | 显示帮助 |
+
+### 未发布版本（本地源码）
+
+将上述命令中的 `npx @liangrk/claude-code-wechatbot` 替换为 `node cli.mjs` 即可，例如：
+
+```bash
+node cli.mjs setup   # 微信扫码登录
+node cli.mjs bot     # 启动独立 Bot 模式
+node cli.mjs status  # 检查连接状态
+```
 
 ### 停止服务
 
