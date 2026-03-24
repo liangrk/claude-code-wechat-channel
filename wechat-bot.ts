@@ -300,6 +300,73 @@ function truncateText(text: string, maxLen: number = MAX_REPLY_LENGTH): string {
   return text.slice(0, maxLen);
 }
 
+/**
+ * Send a long message by splitting it into chunks that fit within MAX_REPLY_LENGTH.
+ * Splits on paragraph boundaries first, then line boundaries.
+ */
+async function sendLongMessage(
+  baseUrl: string,
+  token: string,
+  to: string,
+  text: string,
+  contextToken: string,
+): Promise<void> {
+  if (text.length <= MAX_REPLY_LENGTH) {
+    await sendTextMessageWithRetry(baseUrl, token, to, text, contextToken);
+    return;
+  }
+
+  // Split into chunks
+  const chunks: string[] = [];
+  const remaining = text;
+
+  // First try splitting on double newlines (paragraphs)
+  const paragraphs = remaining.split(/\n\n+/);
+  let current = "";
+
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > MAX_REPLY_LENGTH) {
+      if (current) {
+        chunks.push(current);
+        current = "";
+      }
+      // If single paragraph is too long, split on single newlines
+      if (para.length > MAX_REPLY_LENGTH) {
+        const lines = para.split(/\n/);
+        for (const line of lines) {
+          if (current.length + line.length + 1 > MAX_REPLY_LENGTH) {
+            if (current) {
+              chunks.push(current);
+            }
+            current = line;
+          } else {
+            current = current ? current + "\n" + line : line;
+          }
+        }
+      } else {
+        current = para;
+      }
+    } else {
+      current = current ? current + "\n\n" + para : para;
+    }
+  }
+
+  if (current) {
+    chunks.push(current);
+  }
+
+  log(`消息拆分为 ${chunks.length} 段发送 (总长度 ${text.length})`);
+
+  for (let i = 0; i < chunks.length; i++) {
+    if (i > 0) {
+      // Delay between chunks to avoid rate limiting
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    log(`发送第 ${i + 1}/${chunks.length} 段 (${chunks[i]!.length} 字符)`);
+    await sendTextMessageWithRetry(baseUrl, token, to, chunks[i]!, contextToken);
+  }
+}
+
 // ── Message Extraction ───────────────────────────────────────────────────────
 
 async function extractContentFromMessage(msg: WeixinMessage): Promise<string> {
@@ -488,7 +555,7 @@ async function claudeReplySpawn(
     "json",
     "--dangerously-skip-permissions",
     "--max-turns",
-    "1",
+    "5",
   ];
 
   if (sessionId) {
@@ -535,7 +602,6 @@ async function claudeReplySpawn(
 
       try {
         const result = JSON.parse(stdout.trim());
-        const reply = result.result ?? result.text ?? result.output ?? JSON.stringify(result);
 
         // Extract session_id if this was a new session
         if (!sessionId && result.session_id) {
@@ -544,7 +610,26 @@ async function claudeReplySpawn(
           log(`保存新会话: ${senderId} → ${result.session_id.slice(0, 8)}...`);
         }
 
-        log(`claude 回复: ${reply.slice(0, 80)}...`);
+        let reply: string;
+
+        if (result.subtype === "error_max_turns") {
+          // Claude hit the turn limit — extract whatever text was generated
+          const partial = result.result || result.output || "";
+          if (partial && typeof partial === "string" && partial.length > 0 && !partial.startsWith("{")) {
+            reply = partial;
+            log(`claude 回复 (max_turns, partial): ${reply.slice(0, 80)}...`);
+          } else {
+            reply = "（回复被截断，请尝试将问题拆分为更小的部分）";
+            logError(`claude error_max_turns: 无可用文本内容`);
+          }
+        } else {
+          reply = result.result ?? result.text ?? result.output ?? "";
+          if (!reply || typeof reply !== "string") {
+            reply = JSON.stringify(result);
+          }
+          log(`claude 回复: ${reply.slice(0, 80)}...`);
+        }
+
         resolve(reply);
       } catch {
         // If not valid JSON, use raw stdout
@@ -634,7 +719,7 @@ cron 格式: 分 时 日 月 周（如 "0 9 * * *" 表示每天9点，"*/30 * * 
     "json",
     "--dangerously-skip-permissions",
     "--max-turns",
-    "1",
+    "5",
   ];
   if (sessionId) {
     args.unshift("--resume", sessionId);
@@ -667,6 +752,18 @@ cron 格式: 分 时 日 月 周（如 "0 9 * * *" 表示每天9点，"*/30 * * 
 
       try {
         const result = JSON.parse(stdout.trim());
+
+        // Handle error_max_turns
+        if (result.subtype === "error_max_turns") {
+          const partial = result.result || result.output || "";
+          if (partial && typeof partial === "string" && !partial.startsWith("{")) {
+            resolve({ reply: partial });
+          } else {
+            resolve({ reply: "抱歉，解析定时请求时被截断了，请重试。" });
+          }
+          return;
+        }
+
         const text = result.result ?? result.text ?? result.output ?? "";
 
         // Try to parse as loop_add JSON
@@ -686,7 +783,7 @@ cron 格式: 分 时 日 月 周（如 "0 9 * * *" 表示每天9点，"*/30 * * 
           // Not a loop_add JSON — return as normal text reply
         }
 
-        resolve({ reply: text || JSON.stringify(result) });
+        resolve({ reply: text || "抱歉，无法理解您的定时请求，请重试。" });
       } catch {
         resolve({ reply: stdout.trim().slice(0, MAX_REPLY_LENGTH) });
       }
@@ -850,10 +947,10 @@ async function processMessages(
       await typingManager.sendTyping(senderId, 2);
       typingManager.stopKeepalive(senderId);
 
-      // Send reply back to WeChat
+      // Send reply back to WeChat (long messages are auto-split)
       const contextToken = getCachedContextToken(senderId);
       if (contextToken) {
-        await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, reply, contextToken);
+        await sendLongMessage(account.baseUrl, account.token, senderId, reply, contextToken);
       } else {
         logError(`无法回复 ${senderId}: 缺少 context_token`);
       }

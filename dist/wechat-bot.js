@@ -2170,6 +2170,52 @@ function truncateText(text, maxLen = MAX_REPLY_LENGTH) {
   log3(`\u6D88\u606F\u8D85\u957F (${text.length} \u5B57\u7B26)\uFF0C\u622A\u65AD\u81F3 ${maxLen}`);
   return text.slice(0, maxLen);
 }
+async function sendLongMessage(baseUrl, token, to, text, contextToken) {
+  if (text.length <= MAX_REPLY_LENGTH) {
+    await sendTextMessageWithRetry(baseUrl, token, to, text, contextToken);
+    return;
+  }
+  const chunks = [];
+  const remaining = text;
+  const paragraphs = remaining.split(/\n\n+/);
+  let current = "";
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > MAX_REPLY_LENGTH) {
+      if (current) {
+        chunks.push(current);
+        current = "";
+      }
+      if (para.length > MAX_REPLY_LENGTH) {
+        const lines = para.split(/\n/);
+        for (const line of lines) {
+          if (current.length + line.length + 1 > MAX_REPLY_LENGTH) {
+            if (current) {
+              chunks.push(current);
+            }
+            current = line;
+          } else {
+            current = current ? current + "\n" + line : line;
+          }
+        }
+      } else {
+        current = para;
+      }
+    } else {
+      current = current ? current + "\n\n" + para : para;
+    }
+  }
+  if (current) {
+    chunks.push(current);
+  }
+  log3(`\u6D88\u606F\u62C6\u5206\u4E3A ${chunks.length} \u6BB5\u53D1\u9001 (\u603B\u957F\u5EA6 ${text.length})`);
+  for (let i = 0; i < chunks.length; i++) {
+    if (i > 0) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    log3(`\u53D1\u9001\u7B2C ${i + 1}/${chunks.length} \u6BB5 (${chunks[i].length} \u5B57\u7B26)`);
+    await sendTextMessageWithRetry(baseUrl, token, to, chunks[i], contextToken);
+  }
+}
 async function extractContentFromMessage(msg) {
   if (!msg.item_list?.length) return "";
   for (const item of msg.item_list) {
@@ -2313,7 +2359,7 @@ ${content}
     "json",
     "--dangerously-skip-permissions",
     "--max-turns",
-    "1"
+    "5"
   ];
   if (sessionId) {
     args.unshift("--resume", sessionId);
@@ -2350,13 +2396,28 @@ ${content}
       }
       try {
         const result = JSON.parse(stdout.trim());
-        const reply = result.result ?? result.text ?? result.output ?? JSON.stringify(result);
         if (!sessionId && result.session_id) {
           sessions[senderId] = result.session_id;
           saveSessions(sessions);
           log3(`\u4FDD\u5B58\u65B0\u4F1A\u8BDD: ${senderId} \u2192 ${result.session_id.slice(0, 8)}...`);
         }
-        log3(`claude \u56DE\u590D: ${reply.slice(0, 80)}...`);
+        let reply;
+        if (result.subtype === "error_max_turns") {
+          const partial = result.result || result.output || "";
+          if (partial && typeof partial === "string" && partial.length > 0 && !partial.startsWith("{")) {
+            reply = partial;
+            log3(`claude \u56DE\u590D (max_turns, partial): ${reply.slice(0, 80)}...`);
+          } else {
+            reply = "\uFF08\u56DE\u590D\u88AB\u622A\u65AD\uFF0C\u8BF7\u5C1D\u8BD5\u5C06\u95EE\u9898\u62C6\u5206\u4E3A\u66F4\u5C0F\u7684\u90E8\u5206\uFF09";
+            logError2(`claude error_max_turns: \u65E0\u53EF\u7528\u6587\u672C\u5185\u5BB9`);
+          }
+        } else {
+          reply = result.result ?? result.text ?? result.output ?? "";
+          if (!reply || typeof reply !== "string") {
+            reply = JSON.stringify(result);
+          }
+          log3(`claude \u56DE\u590D: ${reply.slice(0, 80)}...`);
+        }
         resolve(reply);
       } catch {
         const rawReply = stdout.trim().slice(0, MAX_REPLY_LENGTH);
@@ -2422,7 +2483,7 @@ cron \u683C\u5F0F: \u5206 \u65F6 \u65E5 \u6708 \u5468\uFF08\u5982 "0 9 * * *" \u
     "json",
     "--dangerously-skip-permissions",
     "--max-turns",
-    "1"
+    "5"
   ];
   if (sessionId) {
     args.unshift("--resume", sessionId);
@@ -2453,6 +2514,15 @@ cron \u683C\u5F0F: \u5206 \u65F6 \u65E5 \u6708 \u5468\uFF08\u5982 "0 9 * * *" \u
       }
       try {
         const result = JSON.parse(stdout.trim());
+        if (result.subtype === "error_max_turns") {
+          const partial = result.result || result.output || "";
+          if (partial && typeof partial === "string" && !partial.startsWith("{")) {
+            resolve({ reply: partial });
+          } else {
+            resolve({ reply: "\u62B1\u6B49\uFF0C\u89E3\u6790\u5B9A\u65F6\u8BF7\u6C42\u65F6\u88AB\u622A\u65AD\u4E86\uFF0C\u8BF7\u91CD\u8BD5\u3002" });
+          }
+          return;
+        }
         const text = result.result ?? result.text ?? result.output ?? "";
         try {
           const inner = JSON.parse(typeof text === "string" ? text : JSON.stringify(text));
@@ -2468,7 +2538,7 @@ cron \u683C\u5F0F: \u5206 \u65F6 \u65E5 \u6708 \u5468\uFF08\u5982 "0 9 * * *" \u
           }
         } catch {
         }
-        resolve({ reply: text || JSON.stringify(result) });
+        resolve({ reply: text || "\u62B1\u6B49\uFF0C\u65E0\u6CD5\u7406\u89E3\u60A8\u7684\u5B9A\u65F6\u8BF7\u6C42\uFF0C\u8BF7\u91CD\u8BD5\u3002" });
       } catch {
         resolve({ reply: stdout.trim().slice(0, MAX_REPLY_LENGTH) });
       }
@@ -2603,7 +2673,7 @@ ${HELP_TEXT}`;
       typingManager.stopKeepalive(senderId);
       const contextToken = getCachedContextToken(senderId);
       if (contextToken) {
-        await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, reply, contextToken);
+        await sendLongMessage(account.baseUrl, account.token, senderId, reply, contextToken);
       } else {
         logError2(`\u65E0\u6CD5\u56DE\u590D ${senderId}: \u7F3A\u5C11 context_token`);
       }
