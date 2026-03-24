@@ -49,6 +49,52 @@ claude --dangerously-skip-permissions
 
 打开微信，找到 ClawBot 对话，发送消息。消息会出现在 Claude Code 终端中，Claude 的回复会自动发回微信。
 
+## 从源码运行（本地开发）
+
+如果无法通过 npm 安装，可以直接从源码运行：
+
+```bash
+# 1. 克隆项目并安装依赖
+git clone https://github.com/liangrk/claude-code-wechat-channel.git
+cd claude-code-wechat-channel
+npm install
+
+# 2. 构建
+npm run build
+# 或使用 bun:
+# bun run build
+
+# 3. 扫码登录
+node cli.mjs setup
+
+# 4. 检查连接状态
+node cli.mjs status
+
+# 5. 配置 Claude Code
+# 在项目目录下创建 .mcp.json，内容如下（将 /path/to 替换为实际路径）：
+```
+
+`.mcp.json` 配置（本地开发用）：
+
+```json
+{
+  "mcpServers": {
+    "wechat": {
+      "command": "node",
+      "args": ["/path/to/claude-code-wechat-channel/cli.mjs", "start"]
+    }
+  }
+}
+```
+
+然后在包含 `.mcp.json` 的目录下启动 Claude Code：
+
+```bash
+claude --dangerously-skip-permissions
+```
+
+> **注意**: 如果安装了 Bun，也可以用 `bun cli.mjs start` 替代 `node cli.mjs start`，性能更好。
+
 ## 命令说明
 
 | 命令 | 说明 |
