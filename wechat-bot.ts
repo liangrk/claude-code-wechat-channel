@@ -40,6 +40,7 @@ import {
 import { TypingManager } from "./typing.js";
 import { downloadAndDecryptBuffer } from "./media.js";
 import { SessionManager } from "./session-manager.js";
+import { Scheduler, type LoopTask } from "./scheduler.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -565,6 +566,10 @@ async function claudeReplySpawn(
 
 let sessionManager: SessionManager | null = null;
 
+// ── Scheduler (定时任务) ────────────────────────────────────────────────────
+
+const scheduler = new Scheduler();
+
 /**
  * Unified reply function: uses SDK mode if available, falls back to spawn.
  */
@@ -582,12 +587,133 @@ async function claudeReply(
 
 // ── Built-in Commands ───────────────────────────────────────────────────────
 
+const LOOP_KEYWORDS = [
+  "提醒", "定时", "每天", "每隔", "重复", "循环",
+  "日程", "闹钟", "几点", "分钟后", "小时后", "秒后",
+  "倒计时", "定时器", "叫醒", "打卡",
+];
+
+function hasLoopIntent(text: string): boolean {
+  return LOOP_KEYWORDS.some((kw) => text.includes(kw));
+}
+
+// ── Loop Mode: ask Claude to parse natural language into cron ───────────────
+
+interface LoopParseResult {
+  action: "loop_add";
+  cron: string;
+  message: string;
+  next_text: string;
+}
+
+async function claudeReplyLoopMode(
+  senderId: string,
+  content: string,
+  sessions: Record<string, string>,
+  account: AccountData,
+): Promise<{ reply: string; task?: LoopTask }> {
+  const senderName = senderId.split("@")[0] || senderId;
+  const loopPrompt = `用户想要设置定时提醒。请将用户的自然语言描述转换为标准 cron 表达式。
+
+当前时间: ${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
+
+用户消息: ${content}
+
+请严格按照以下 JSON 格式回复，不要包含任何其他内容：
+{"action":"loop_add","cron":"标准5字段cron表达式","message":"提醒内容（简短）","next_text":"已设置的中文确认描述"}
+
+cron 格式: 分 时 日 月 周（如 "0 9 * * *" 表示每天9点，"*/30 * * * *" 表示每30分钟）
+
+如果用户的请求无法转换为定时任务（如时间不明确），请直接用中文回复原因，不要返回 JSON。`;
+
+  const sessionId = sessions[senderId];
+  const args = [
+    "-p",
+    loopPrompt,
+    "--output-format",
+    "json",
+    "--dangerously-skip-permissions",
+    "--max-turns",
+    "1",
+  ];
+  if (sessionId) {
+    args.unshift("--resume", sessionId);
+  }
+
+  log(`[loop] 调用 Claude 解析定时意图: ${content.slice(0, 50)}...`);
+
+  return new Promise((resolve) => {
+    const child = spawn("claude", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "" },
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve({ reply: "抱歉，解析定时请求超时了。" });
+    }, 60_000);
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0 || !stdout.trim()) {
+        resolve({ reply: "抱歉，解析定时请求失败了。" });
+        return;
+      }
+
+      try {
+        const result = JSON.parse(stdout.trim());
+        const text = result.result ?? result.text ?? result.output ?? "";
+
+        // Try to parse as loop_add JSON
+        try {
+          const inner = JSON.parse(typeof text === "string" ? text : JSON.stringify(text));
+          if (inner.action === "loop_add" && inner.cron && inner.message) {
+            const task = scheduler.add(senderId, inner.cron, inner.message);
+            if (task) {
+              resolve({ reply: inner.next_text || `已设置定时任务 [${task.id}]: ${inner.cron} — ${inner.message}`, task });
+              return;
+            } else {
+              resolve({ reply: `无法解析 cron 表达式: ${inner.cron}，请换一种说法试试。` });
+              return;
+            }
+          }
+        } catch {
+          // Not a loop_add JSON — return as normal text reply
+        }
+
+        resolve({ reply: text || JSON.stringify(result) });
+      } catch {
+        resolve({ reply: stdout.trim().slice(0, MAX_REPLY_LENGTH) });
+      }
+    });
+
+    child.on("error", () => {
+      clearTimeout(timeout);
+      resolve({ reply: "Claude Code 未安装或无法启动。" });
+    });
+  });
+}
+
 const HELP_TEXT = [
   "可用命令：",
   "/help — 显示此帮助",
   "/clear — 清空对话上下文，开始新会话",
+  "/loop — 查看定时任务",
+  "/loop rm <ID> — 删除定时任务",
+  "/loop off — 暂停所有定时任务",
+  "/loop on — 恢复所有定时任务",
   "",
-  "其他消息会直接发送给 Claude Code 处理。",
+  "定时提醒：直接用自然语言描述即可，如：",
+  "  \"每天早上9点提醒我喝水\"",
+  "  \"每30分钟检查邮件\"",
+  "  \"下周一下午3点开会\"",
+  "",
+  "其他消息会直接发送给 Claude 处理。",
 ].join("\n");
 
 // ── Long-poll loop ──────────────────────────────────────────────────────────
@@ -654,6 +780,61 @@ async function processMessages(
         } catch (err) {
           logError(`发送 /help 回复失败: ${String(err)}`);
         }
+      }
+      continue;
+    }
+
+    // Handle /loop commands
+    if (trimmed === "/loop" || trimmed.startsWith("/loop ")) {
+      const sub = trimmed.slice(5).trim();
+      const contextToken = getCachedContextToken(senderId);
+      let reply = "";
+
+      if (sub === "" || sub === "list") {
+        reply = Scheduler.formatTaskList(scheduler.list(senderId));
+      } else if (sub.startsWith("rm ") || sub.startsWith("del ")) {
+        const id = sub.slice(3).trim();
+        if (scheduler.remove(id)) {
+          reply = `已删除任务 ${id}`;
+        } else {
+          reply = `未找到任务 ${id}，使用 /loop list 查看所有任务`;
+        }
+      } else if (sub === "off") {
+        const count = scheduler.disableAll(senderId);
+        reply = count > 0 ? `已暂停 ${count} 个任务` : "没有需要暂停的任务";
+      } else if (sub === "on") {
+        const count = scheduler.enableAll(senderId);
+        reply = count > 0 ? `已恢复 ${count} 个任务` : "没有需要恢复的任务";
+      } else {
+        reply = `未知命令: /loop ${sub}\n${HELP_TEXT}`;
+      }
+
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, reply, contextToken);
+        } catch (err) {
+          logError(`发送 /loop 回复失败: ${String(err)}`);
+        }
+      }
+      continue;
+    }
+
+    // Detect loop/schedule intent from natural language
+    if (hasLoopIntent(trimmed)) {
+      await typingManager.sendTyping(senderId, 1);
+      typingManager.startKeepalive(senderId);
+      try {
+        const { reply: loopReply } = await claudeReplyLoopMode(senderId, trimmed, sessions, account);
+        await typingManager.sendTyping(senderId, 2);
+        typingManager.stopKeepalive(senderId);
+        const contextToken = getCachedContextToken(senderId);
+        if (contextToken) {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, loopReply, contextToken);
+        }
+      } catch (err) {
+        logError(`处理定时意图失败: ${String(err)}`);
+        await typingManager.sendTyping(senderId, 2);
+        typingManager.stopKeepalive(senderId);
       }
       continue;
     }
@@ -856,6 +1037,7 @@ async function main() {
   // Cleanup on exit
   const cleanup = () => {
     typingManager.stopAll();
+    scheduler.stop();
     sessionManager?.closeAll();
     releaseLock();
     saveContextTokens();
@@ -947,6 +1129,23 @@ async function main() {
   }
 
   typingManager.configure(account.accountId, account.token, account.baseUrl);
+
+  // Initialize scheduler
+  scheduler.load();
+  scheduler.onFire(async (task: LoopTask) => {
+    const contextToken = getCachedContextToken(task.senderId);
+    if (contextToken) {
+      try {
+        log(`[scheduler] 发送定时提醒: ${task.id} → ${task.senderId}`);
+        await sendTextMessageWithRetry(account.baseUrl, account.token, task.senderId, `⏰ ${task.message}`, contextToken);
+      } catch (err) {
+        logError(`[scheduler] 发送定时提醒失败: ${String(err)}`);
+      }
+    } else {
+      logError(`[scheduler] 无法发送提醒 ${task.id}: 缺少 context_token`);
+    }
+  });
+  scheduler.start(30_000);
 
   // Start long-poll (runs forever)
   await startPolling(account, sessions, sessionManager);

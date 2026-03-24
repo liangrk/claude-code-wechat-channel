@@ -128,6 +128,10 @@ export function getSessionsFile(): string {
   return path.join(getCredentialsDir(), "sessions.json");
 }
 
+export function getLoopsFile(): string {
+  return path.join(getCredentialsDir(), "loops.json");
+}
+
 // ── Credentials I/O ─────────────────────────────────────────────────────────
 
 export function loadCredentials(): AccountData | null {

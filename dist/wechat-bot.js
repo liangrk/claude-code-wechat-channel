@@ -1096,8 +1096,8 @@ var require_main = __commonJS({
 });
 
 // wechat-bot.ts
-import crypto3 from "node:crypto";
-import fs3 from "node:fs";
+import crypto4 from "node:crypto";
+import fs4 from "node:fs";
 import path2 from "node:path";
 import process2 from "node:process";
 import { spawn, execSync } from "node:child_process";
@@ -1140,6 +1140,9 @@ function getLockPidFile() {
 }
 function getSessionsFile() {
   return path.join(getCredentialsDir(), "sessions.json");
+}
+function getLoopsFile() {
+  return path.join(getCredentialsDir(), "loops.json");
 }
 function loadCredentials() {
   try {
@@ -1700,6 +1703,279 @@ ${content}
   }
 };
 
+// scheduler.ts
+import crypto3 from "node:crypto";
+import fs3 from "node:fs";
+function log2(msg) {
+  process.stderr.write(`[scheduler] ${msg}
+`);
+}
+function parseCronFields(cron) {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+  return parts.map((part, fieldIdx) => {
+    const ranges = [
+      [0, 59],
+      // minute
+      [0, 23],
+      // hour
+      [1, 31],
+      // day
+      [1, 12],
+      // month
+      [0, 6]
+      // weekday (0=Sun)
+    ];
+    const [min, max] = ranges[fieldIdx];
+    if (part === "*") return -1;
+    if (part.includes("/")) {
+      const [base, stepStr] = part.split("/");
+      const step = parseInt(stepStr, 10);
+      if (isNaN(step) || step <= 0) return null;
+      const start = base === "*" ? min : parseInt(base, 10);
+      if (isNaN(start) || start < min || start > max) return null;
+      return step;
+    }
+    if (part.includes("-")) {
+      const [loStr, hiStr] = part.split("-");
+      const lo = parseSingle(loStr);
+      const hi = parseSingle(hiStr);
+      if (lo === null || hi === null) return null;
+      if (lo < min || hi > max) return null;
+      return -(lo * 100 + hi);
+    }
+    if (part.includes(",")) {
+      return part.split(",").map(parseSingle).reduce((acc, v) => {
+        if (v === null || v < min || v > max) return null;
+        if (acc === null) return null;
+        return acc | 1 << v;
+      }, 0) ?? null;
+    }
+    const val = parseSingle(part);
+    if (val === null || val < min || val > max) return null;
+    return val;
+  });
+}
+function parseSingle(s) {
+  const n = parseInt(s.trim(), 10);
+  return isNaN(n) ? null : n;
+}
+function matchesField(value, parsed, fieldIdx) {
+  const ranges = [
+    [0, 59],
+    [0, 23],
+    [1, 31],
+    [1, 12],
+    [0, 6]
+  ];
+  const [min] = ranges[fieldIdx];
+  if (parsed === -1) return true;
+  if (parsed >= 0 && parsed <= 59 && fieldIdx === 0) {
+    return value === parsed;
+  }
+  if (parsed >= 0 && fieldIdx === 1) {
+    return value === parsed;
+  }
+  if (parsed >= 0) {
+    return value === parsed;
+  }
+  if (parsed < 0) {
+    const abs = Math.abs(parsed);
+    const lo = Math.floor(abs / 100);
+    const hi = abs % 100;
+    return value >= lo && value <= hi;
+  }
+  return (parsed & 1 << value) !== 0;
+}
+function getNextCronRun(cron) {
+  const fields = parseCronFields(cron);
+  if (!fields || fields.some((f) => f === null)) return null;
+  const now = /* @__PURE__ */ new Date();
+  const start = new Date(now.getTime() + 6e4);
+  start.setSeconds(0, 0);
+  const maxIter = 366 * 24 * 60;
+  const cursor = new Date(start);
+  for (let i = 0; i < maxIter; i++) {
+    const m = cursor.getMinutes();
+    const h = cursor.getHours();
+    const d = cursor.getDate();
+    const mon = cursor.getMonth() + 1;
+    const w = cursor.getDay();
+    if (matchesField(m, fields[0], 0) && matchesField(h, fields[1], 1) && matchesField(d, fields[2], 2) && matchesField(mon, fields[3], 3) && matchesField(w, fields[4], 4)) {
+      return cursor.getTime();
+    }
+    cursor.setMinutes(cursor.getMinutes() + 1);
+  }
+  return null;
+}
+var Scheduler = class {
+  tasks = /* @__PURE__ */ new Map();
+  callback = null;
+  timer = null;
+  constructor() {
+  }
+  /** Load persisted tasks from disk */
+  load() {
+    const file = getLoopsFile();
+    try {
+      if (!fs3.existsSync(file)) return;
+      const data = JSON.parse(fs3.readFileSync(file, "utf-8"));
+      const now = Date.now();
+      for (const task of data) {
+        if (!task.id || !task.senderId) continue;
+        if (task.enabled && task.nextRun < now) {
+          const next = getNextCronRun(task.cron);
+          if (next) {
+            task.nextRun = next;
+          } else {
+            task.enabled = false;
+          }
+        }
+        this.tasks.set(task.id, task);
+      }
+      log2(`\u52A0\u8F7D ${this.tasks.size} \u4E2A\u5B9A\u65F6\u4EFB\u52A1`);
+    } catch (err) {
+      log2(`\u52A0\u8F7D\u5B9A\u65F6\u4EFB\u52A1\u5931\u8D25: ${String(err)}`);
+    }
+  }
+  /** Persist tasks to disk */
+  save() {
+    try {
+      const dir = getCredentialsDir();
+      fs3.mkdirSync(dir, { recursive: true });
+      const data = [...this.tasks.values()];
+      fs3.writeFileSync(getLoopsFile(), JSON.stringify(data, null, 2), "utf-8");
+    } catch (err) {
+      log2(`\u4FDD\u5B58\u5B9A\u65F6\u4EFB\u52A1\u5931\u8D25: ${String(err)}`);
+    }
+  }
+  /** Set the callback for firing tasks */
+  onFire(cb) {
+    this.callback = cb;
+  }
+  /** Add a new task */
+  add(senderId, cron, message) {
+    const nextRun = getNextCronRun(cron);
+    if (!nextRun) {
+      log2(`\u65E0\u6548\u7684 cron \u8868\u8FBE\u5F0F: ${cron}`);
+      return null;
+    }
+    const task = {
+      id: crypto3.randomBytes(4).toString("hex"),
+      senderId,
+      message,
+      cron,
+      nextRun,
+      enabled: true,
+      createdAt: Date.now()
+    };
+    this.tasks.set(task.id, task);
+    this.save();
+    log2(`\u6DFB\u52A0\u5B9A\u65F6\u4EFB\u52A1: ${task.id} cron=${cron} next=${new Date(nextRun).toISOString()}`);
+    return task;
+  }
+  /** Remove a task by ID */
+  remove(id) {
+    const removed = this.tasks.delete(id);
+    if (removed) this.save();
+    return removed;
+  }
+  /** Remove all tasks for a sender */
+  removeBySender(senderId) {
+    let count = 0;
+    for (const [id, task] of this.tasks) {
+      if (task.senderId === senderId) {
+        this.tasks.delete(id);
+        count++;
+      }
+    }
+    if (count > 0) this.save();
+    return count;
+  }
+  /** List tasks for a sender */
+  list(senderId) {
+    return [...this.tasks.values()].filter((t) => t.senderId === senderId);
+  }
+  /** Enable all tasks for a sender */
+  enableAll(senderId) {
+    let count = 0;
+    for (const task of this.tasks.values()) {
+      if (task.senderId === senderId && !task.enabled) {
+        const next = getNextCronRun(task.cron);
+        if (next) {
+          task.nextRun = next;
+          task.enabled = true;
+          count++;
+        }
+      }
+    }
+    if (count > 0) this.save();
+    return count;
+  }
+  /** Disable all tasks for a sender */
+  disableAll(senderId) {
+    let count = 0;
+    for (const task of this.tasks.values()) {
+      if (task.senderId === senderId && task.enabled) {
+        task.enabled = false;
+        count++;
+      }
+    }
+    if (count > 0) this.save();
+    return count;
+  }
+  /** Check for due tasks and fire them */
+  tick() {
+    const now = Date.now();
+    for (const task of this.tasks.values()) {
+      if (!task.enabled) continue;
+      if (task.nextRun > now) continue;
+      log2(`\u89E6\u53D1\u5B9A\u65F6\u4EFB\u52A1: ${task.id} sender=${task.senderId} msg=${task.message.slice(0, 30)}`);
+      if (this.callback) {
+        try {
+          this.callback(task);
+        } catch (err) {
+          log2(`\u5B9A\u65F6\u4EFB\u52A1\u56DE\u8C03\u5931\u8D25: ${String(err)}`);
+        }
+      }
+      const next = getNextCronRun(task.cron);
+      if (next) {
+        task.nextRun = next;
+        this.save();
+      } else {
+        task.enabled = false;
+        this.save();
+        log2(`\u5B9A\u65F6\u4EFB\u52A1 ${task.id} \u65E0\u6CD5\u8BA1\u7B97\u4E0B\u6B21\u6267\u884C\u65F6\u95F4\uFF0C\u5DF2\u7981\u7528`);
+      }
+    }
+  }
+  /** Start the tick interval */
+  start(intervalMs = 3e4) {
+    if (this.timer) return;
+    this.tick();
+    this.timer = setInterval(() => this.tick(), intervalMs);
+    log2(`\u5B9A\u65F6\u8C03\u5EA6\u5668\u5DF2\u542F\u52A8 (\u95F4\u9694 ${intervalMs / 1e3}s)`);
+  }
+  /** Stop the tick interval */
+  stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+  /** Format task list for display */
+  static formatTaskList(tasks) {
+    if (tasks.length === 0) return "\u6682\u65E0\u5B9A\u65F6\u4EFB\u52A1\u3002";
+    const lines = tasks.map((t) => {
+      const status = t.enabled ? "\u542F\u7528" : "\u6682\u505C";
+      const next = t.enabled ? new Date(t.nextRun).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "-";
+      return `  [${t.id}] ${status} | ${t.cron} | \u4E0B\u6B21: ${next} | ${t.message}`;
+    });
+    return `\u5B9A\u65F6\u4EFB\u52A1 (${tasks.length}):
+${lines.join("\n")}`;
+  }
+};
+
 // wechat-bot.ts
 var MAX_CONSECUTIVE_FAILURES = 3;
 var MAX_REPLY_LENGTH = 4096;
@@ -1710,7 +1986,7 @@ var CONTEXT_TOKEN_TTL_MS = 24 * 60 * 60 * 1e3;
 var LONG_POLL_TIMEOUT_MIN_MS = 1e4;
 var LONG_POLL_TIMEOUT_MAX_MS = 6e4;
 var CLAUDE_TIMEOUT_MS = 12e4;
-function log2(msg) {
+function log3(msg) {
   process2.stderr.write(`[wechat-bot] ${msg}
 `);
 }
@@ -1725,15 +2001,15 @@ var contextTokenCache = /* @__PURE__ */ new Map();
 function loadContextTokens() {
   try {
     const file = getContextTokensFile();
-    if (!fs3.existsSync(file)) return;
-    const data = JSON.parse(fs3.readFileSync(file, "utf-8"));
+    if (!fs4.existsSync(file)) return;
+    const data = JSON.parse(fs4.readFileSync(file, "utf-8"));
     const now = Date.now();
     for (const [key, entry] of Object.entries(data)) {
       if (now - entry.ts < CONTEXT_TOKEN_TTL_MS) {
         contextTokenCache.set(key, { token: entry.token, lastAccessed: entry.ts });
       }
     }
-    log2(`\u52A0\u8F7D context_token \u7F13\u5B58: ${contextTokenCache.size} \u6761`);
+    log3(`\u52A0\u8F7D context_token \u7F13\u5B58: ${contextTokenCache.size} \u6761`);
   } catch {
   }
 }
@@ -1741,14 +2017,14 @@ function saveContextTokens() {
   try {
     const dir = getCredentialsDir();
     const file = getContextTokensFile();
-    fs3.mkdirSync(dir, { recursive: true });
+    fs4.mkdirSync(dir, { recursive: true });
     const data = {};
     for (const [key, entry] of contextTokenCache.entries()) {
       data[key] = { token: entry.token, ts: entry.lastAccessed };
     }
-    fs3.writeFileSync(file, JSON.stringify(data), "utf-8");
+    fs4.writeFileSync(file, JSON.stringify(data), "utf-8");
     try {
-      fs3.chmodSync(file, 384);
+      fs4.chmodSync(file, 384);
     } catch {
     }
   } catch {
@@ -1789,8 +2065,8 @@ function getCachedContextToken(userId) {
 var SESSIONS_FILE = path2.join(getCredentialsDir(), "sessions.json");
 function loadSessions() {
   try {
-    if (!fs3.existsSync(SESSIONS_FILE)) return {};
-    return JSON.parse(fs3.readFileSync(SESSIONS_FILE, "utf-8"));
+    if (!fs4.existsSync(SESSIONS_FILE)) return {};
+    return JSON.parse(fs4.readFileSync(SESSIONS_FILE, "utf-8"));
   } catch {
     return {};
   }
@@ -1798,10 +2074,10 @@ function loadSessions() {
 function saveSessions(sessions) {
   try {
     const dir = getCredentialsDir();
-    fs3.mkdirSync(dir, { recursive: true });
-    fs3.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions), "utf-8");
+    fs4.mkdirSync(dir, { recursive: true });
+    fs4.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions), "utf-8");
     try {
-      fs3.chmodSync(SESSIONS_FILE, 384);
+      fs4.chmodSync(SESSIONS_FILE, 384);
     } catch {
     }
   } catch {
@@ -1814,7 +2090,7 @@ function clearSession(sessions, senderId) {
 var LOCK_STALE_TIMEOUT_MS = 10 * 60 * 1e3;
 function getLockFileAge(lockFile) {
   try {
-    const stat = fs3.statSync(lockFile);
+    const stat = fs4.statSync(lockFile);
     return Date.now() - stat.mtimeMs;
   } catch {
     return Infinity;
@@ -1833,36 +2109,36 @@ function isLikelyWechatBot(pid) {
 function acquireLock() {
   const lockFile = getLockPidFile();
   try {
-    fs3.mkdirSync(getCredentialsDir(), { recursive: true });
+    fs4.mkdirSync(getCredentialsDir(), { recursive: true });
     try {
-      const fd = fs3.openSync(lockFile, "wx");
-      fs3.writeSync(fd, String(process2.pid));
-      fs3.closeSync(fd);
+      const fd = fs4.openSync(lockFile, "wx");
+      fs4.writeSync(fd, String(process2.pid));
+      fs4.closeSync(fd);
       return true;
     } catch (err) {
       if (err.code === "EEXIST") {
         try {
-          const existingPid = parseInt(fs3.readFileSync(lockFile, "utf-8").trim(), 10);
+          const existingPid = parseInt(fs4.readFileSync(lockFile, "utf-8").trim(), 10);
           if (!isNaN(existingPid)) {
             process2.kill(existingPid, 0);
             const age = getLockFileAge(lockFile);
             if (age > LOCK_STALE_TIMEOUT_MS) {
-              log2(`\u9501\u6587\u4EF6\u5DF2\u8FC7\u671F (${Math.round(age / 6e4)} \u5206\u949F\u524D\u521B\u5EFA)\uFF0C\u5C1D\u8BD5\u6E05\u7406...`);
+              log3(`\u9501\u6587\u4EF6\u5DF2\u8FC7\u671F (${Math.round(age / 6e4)} \u5206\u949F\u524D\u521B\u5EFA)\uFF0C\u5C1D\u8BD5\u6E05\u7406...`);
             } else if (isLikelyWechatBot(existingPid)) {
               logError2(`\u53E6\u4E00\u4E2A\u5B9E\u4F8B\u5DF2\u5728\u8FD0\u884C (PID ${existingPid})\uFF0C\u9000\u51FA\u3002`);
               return false;
             } else {
-              log2(`PID ${existingPid} \u5B58\u6D3B\u4F46\u4E0D\u662F wechat \u8FDB\u7A0B (\u53EF\u80FD PID \u590D\u7528)\uFF0C\u6E05\u7406\u9501\u6587\u4EF6...`);
+              log3(`PID ${existingPid} \u5B58\u6D3B\u4F46\u4E0D\u662F wechat \u8FDB\u7A0B (\u53EF\u80FD PID \u590D\u7528)\uFF0C\u6E05\u7406\u9501\u6587\u4EF6...`);
             }
           }
         } catch {
         }
         try {
-          fs3.unlinkSync(lockFile);
-          const fd = fs3.openSync(lockFile, "wx");
-          fs3.writeSync(fd, String(process2.pid));
-          fs3.closeSync(fd);
-          log2("\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6\u5E76\u91CD\u65B0\u83B7\u53D6\u9501");
+          fs4.unlinkSync(lockFile);
+          const fd = fs4.openSync(lockFile, "wx");
+          fs4.writeSync(fd, String(process2.pid));
+          fs4.closeSync(fd);
+          log3("\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6\u5E76\u91CD\u65B0\u83B7\u53D6\u9501");
           return true;
         } catch {
           logError2("\u65E0\u6CD5\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6");
@@ -1880,10 +2156,10 @@ function acquireLock() {
 function releaseLock() {
   try {
     const lockFile = getLockPidFile();
-    if (fs3.existsSync(lockFile)) {
-      const pid = fs3.readFileSync(lockFile, "utf-8").trim();
+    if (fs4.existsSync(lockFile)) {
+      const pid = fs4.readFileSync(lockFile, "utf-8").trim();
       if (pid === String(process2.pid)) {
-        fs3.unlinkSync(lockFile);
+        fs4.unlinkSync(lockFile);
       }
     }
   } catch {
@@ -1891,7 +2167,7 @@ function releaseLock() {
 }
 function truncateText(text, maxLen = MAX_REPLY_LENGTH) {
   if (text.length <= maxLen) return text;
-  log2(`\u6D88\u606F\u8D85\u957F (${text.length} \u5B57\u7B26)\uFF0C\u622A\u65AD\u81F3 ${maxLen}`);
+  log3(`\u6D88\u606F\u8D85\u957F (${text.length} \u5B57\u7B26)\uFF0C\u622A\u65AD\u81F3 ${maxLen}`);
   return text.slice(0, maxLen);
 }
 async function extractContentFromMessage(msg) {
@@ -1983,7 +2259,7 @@ async function getUpdates(baseUrl, token, getUpdatesBuf, timeoutMs) {
   }
 }
 function generateClientId() {
-  return `claude-wechat:${Date.now()}-${crypto3.randomBytes(4).toString("hex")}`;
+  return `claude-wechat:${Date.now()}-${crypto4.randomBytes(4).toString("hex")}`;
 }
 async function sendTextMessage(baseUrl, token, to, text, contextToken) {
   const truncatedText = truncateText(text);
@@ -2016,7 +2292,7 @@ async function sendTextMessageWithRetry(baseUrl, token, to, text, contextToken) 
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt < SEND_RETRY_COUNT) {
-        log2(`\u53D1\u9001\u5931\u8D25 (\u7B2C ${attempt + 1} \u6B21)\uFF0C${SEND_RETRY_DELAY_MS / 1e3}s \u540E\u91CD\u8BD5...`);
+        log3(`\u53D1\u9001\u5931\u8D25 (\u7B2C ${attempt + 1} \u6B21)\uFF0C${SEND_RETRY_DELAY_MS / 1e3}s \u540E\u91CD\u8BD5...`);
         await new Promise((r) => setTimeout(r, SEND_RETRY_DELAY_MS));
       }
     }
@@ -2042,7 +2318,7 @@ ${content}
   if (sessionId) {
     args.unshift("--resume", sessionId);
   }
-  log2(`\u8C03\u7528 claude ${sessionId ? `--resume ${sessionId.slice(0, 8)}...` : "(\u65B0\u4F1A\u8BDD)"} \u2014 ${content.slice(0, 50)}...`);
+  log3(`\u8C03\u7528 claude ${sessionId ? `--resume ${sessionId.slice(0, 8)}...` : "(\u65B0\u4F1A\u8BDD)"} \u2014 ${content.slice(0, 50)}...`);
   return new Promise((resolve) => {
     const child = spawn("claude", args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -2078,13 +2354,13 @@ ${content}
         if (!sessionId && result.session_id) {
           sessions[senderId] = result.session_id;
           saveSessions(sessions);
-          log2(`\u4FDD\u5B58\u65B0\u4F1A\u8BDD: ${senderId} \u2192 ${result.session_id.slice(0, 8)}...`);
+          log3(`\u4FDD\u5B58\u65B0\u4F1A\u8BDD: ${senderId} \u2192 ${result.session_id.slice(0, 8)}...`);
         }
-        log2(`claude \u56DE\u590D: ${reply.slice(0, 80)}...`);
+        log3(`claude \u56DE\u590D: ${reply.slice(0, 80)}...`);
         resolve(reply);
       } catch {
         const rawReply = stdout.trim().slice(0, MAX_REPLY_LENGTH);
-        log2(`claude \u56DE\u590D (raw): ${rawReply.slice(0, 80)}...`);
+        log3(`claude \u56DE\u590D (raw): ${rawReply.slice(0, 80)}...`);
         resolve(rawReply);
       }
     });
@@ -2096,18 +2372,128 @@ ${content}
   });
 }
 var sessionManager = null;
+var scheduler = new Scheduler();
 async function claudeReply(senderId, content, sessions, account) {
   if (sessionManager?.isSdkMode) {
     return sessionManager.sendMessage(senderId, content);
   }
   return claudeReplySpawn(senderId, content, sessions, account);
 }
+var LOOP_KEYWORDS = [
+  "\u63D0\u9192",
+  "\u5B9A\u65F6",
+  "\u6BCF\u5929",
+  "\u6BCF\u9694",
+  "\u91CD\u590D",
+  "\u5FAA\u73AF",
+  "\u65E5\u7A0B",
+  "\u95F9\u949F",
+  "\u51E0\u70B9",
+  "\u5206\u949F\u540E",
+  "\u5C0F\u65F6\u540E",
+  "\u79D2\u540E",
+  "\u5012\u8BA1\u65F6",
+  "\u5B9A\u65F6\u5668",
+  "\u53EB\u9192",
+  "\u6253\u5361"
+];
+function hasLoopIntent(text) {
+  return LOOP_KEYWORDS.some((kw) => text.includes(kw));
+}
+async function claudeReplyLoopMode(senderId, content, sessions, account) {
+  const senderName = senderId.split("@")[0] || senderId;
+  const loopPrompt = `\u7528\u6237\u60F3\u8981\u8BBE\u7F6E\u5B9A\u65F6\u63D0\u9192\u3002\u8BF7\u5C06\u7528\u6237\u7684\u81EA\u7136\u8BED\u8A00\u63CF\u8FF0\u8F6C\u6362\u4E3A\u6807\u51C6 cron \u8868\u8FBE\u5F0F\u3002
+
+\u5F53\u524D\u65F6\u95F4: ${(/* @__PURE__ */ new Date()).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
+
+\u7528\u6237\u6D88\u606F: ${content}
+
+\u8BF7\u4E25\u683C\u6309\u7167\u4EE5\u4E0B JSON \u683C\u5F0F\u56DE\u590D\uFF0C\u4E0D\u8981\u5305\u542B\u4EFB\u4F55\u5176\u4ED6\u5185\u5BB9\uFF1A
+{"action":"loop_add","cron":"\u6807\u51C65\u5B57\u6BB5cron\u8868\u8FBE\u5F0F","message":"\u63D0\u9192\u5185\u5BB9\uFF08\u7B80\u77ED\uFF09","next_text":"\u5DF2\u8BBE\u7F6E\u7684\u4E2D\u6587\u786E\u8BA4\u63CF\u8FF0"}
+
+cron \u683C\u5F0F: \u5206 \u65F6 \u65E5 \u6708 \u5468\uFF08\u5982 "0 9 * * *" \u8868\u793A\u6BCF\u59299\u70B9\uFF0C"*/30 * * * *" \u8868\u793A\u6BCF30\u5206\u949F\uFF09
+
+\u5982\u679C\u7528\u6237\u7684\u8BF7\u6C42\u65E0\u6CD5\u8F6C\u6362\u4E3A\u5B9A\u65F6\u4EFB\u52A1\uFF08\u5982\u65F6\u95F4\u4E0D\u660E\u786E\uFF09\uFF0C\u8BF7\u76F4\u63A5\u7528\u4E2D\u6587\u56DE\u590D\u539F\u56E0\uFF0C\u4E0D\u8981\u8FD4\u56DE JSON\u3002`;
+  const sessionId = sessions[senderId];
+  const args = [
+    "-p",
+    loopPrompt,
+    "--output-format",
+    "json",
+    "--dangerously-skip-permissions",
+    "--max-turns",
+    "1"
+  ];
+  if (sessionId) {
+    args.unshift("--resume", sessionId);
+  }
+  log3(`[loop] \u8C03\u7528 Claude \u89E3\u6790\u5B9A\u65F6\u610F\u56FE: ${content.slice(0, 50)}...`);
+  return new Promise((resolve) => {
+    const child = spawn("claude", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process2.env, ANTHROPIC_API_KEY: process2.env.ANTHROPIC_API_KEY ?? "" }
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve({ reply: "\u62B1\u6B49\uFF0C\u89E3\u6790\u5B9A\u65F6\u8BF7\u6C42\u8D85\u65F6\u4E86\u3002" });
+    }, 6e4);
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0 || !stdout.trim()) {
+        resolve({ reply: "\u62B1\u6B49\uFF0C\u89E3\u6790\u5B9A\u65F6\u8BF7\u6C42\u5931\u8D25\u4E86\u3002" });
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout.trim());
+        const text = result.result ?? result.text ?? result.output ?? "";
+        try {
+          const inner = JSON.parse(typeof text === "string" ? text : JSON.stringify(text));
+          if (inner.action === "loop_add" && inner.cron && inner.message) {
+            const task = scheduler.add(senderId, inner.cron, inner.message);
+            if (task) {
+              resolve({ reply: inner.next_text || `\u5DF2\u8BBE\u7F6E\u5B9A\u65F6\u4EFB\u52A1 [${task.id}]: ${inner.cron} \u2014 ${inner.message}`, task });
+              return;
+            } else {
+              resolve({ reply: `\u65E0\u6CD5\u89E3\u6790 cron \u8868\u8FBE\u5F0F: ${inner.cron}\uFF0C\u8BF7\u6362\u4E00\u79CD\u8BF4\u6CD5\u8BD5\u8BD5\u3002` });
+              return;
+            }
+          }
+        } catch {
+        }
+        resolve({ reply: text || JSON.stringify(result) });
+      } catch {
+        resolve({ reply: stdout.trim().slice(0, MAX_REPLY_LENGTH) });
+      }
+    });
+    child.on("error", () => {
+      clearTimeout(timeout);
+      resolve({ reply: "Claude Code \u672A\u5B89\u88C5\u6216\u65E0\u6CD5\u542F\u52A8\u3002" });
+    });
+  });
+}
 var HELP_TEXT = [
   "\u53EF\u7528\u547D\u4EE4\uFF1A",
   "/help \u2014 \u663E\u793A\u6B64\u5E2E\u52A9",
   "/clear \u2014 \u6E05\u7A7A\u5BF9\u8BDD\u4E0A\u4E0B\u6587\uFF0C\u5F00\u59CB\u65B0\u4F1A\u8BDD",
+  "/loop \u2014 \u67E5\u770B\u5B9A\u65F6\u4EFB\u52A1",
+  "/loop rm <ID> \u2014 \u5220\u9664\u5B9A\u65F6\u4EFB\u52A1",
+  "/loop off \u2014 \u6682\u505C\u6240\u6709\u5B9A\u65F6\u4EFB\u52A1",
+  "/loop on \u2014 \u6062\u590D\u6240\u6709\u5B9A\u65F6\u4EFB\u52A1",
   "",
-  "\u5176\u4ED6\u6D88\u606F\u4F1A\u76F4\u63A5\u53D1\u9001\u7ED9 Claude Code \u5904\u7406\u3002"
+  "\u5B9A\u65F6\u63D0\u9192\uFF1A\u76F4\u63A5\u7528\u81EA\u7136\u8BED\u8A00\u63CF\u8FF0\u5373\u53EF\uFF0C\u5982\uFF1A",
+  '  "\u6BCF\u5929\u65E9\u4E0A9\u70B9\u63D0\u9192\u6211\u559D\u6C34"',
+  '  "\u6BCF30\u5206\u949F\u68C0\u67E5\u90AE\u4EF6"',
+  '  "\u4E0B\u5468\u4E00\u4E0B\u53483\u70B9\u5F00\u4F1A"',
+  "",
+  "\u5176\u4ED6\u6D88\u606F\u4F1A\u76F4\u63A5\u53D1\u9001\u7ED9 Claude \u5904\u7406\u3002"
 ].join("\n");
 function computeBackoffMs(failures) {
   const base = Math.pow(2, failures) * 2e3;
@@ -2119,7 +2505,7 @@ async function processMessages(msgs, account, sessions, manager) {
   for (const msg of msgs ?? []) {
     const senderId = msg.from_user_id ?? "unknown";
     const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
-    log2(`\u5165\u7AD9\u6D88\u606F: from=${senderId} msg_type=${msg.message_type} items=[${types}]`);
+    log3(`\u5165\u7AD9\u6D88\u606F: from=${senderId} msg_type=${msg.message_type} items=[${types}]`);
     if (msg.message_type !== MSG_TYPE_USER) continue;
     if (msg.context_token) {
       cacheContextToken(senderId, msg.context_token);
@@ -2127,10 +2513,10 @@ async function processMessages(msgs, account, sessions, manager) {
     const content = await extractContentFromMessage(msg);
     if (!content) {
       const itemTypes = msg.item_list?.map((i) => i.type).join(",") ?? "none";
-      log2(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${itemTypes}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
+      log3(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${itemTypes}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
       continue;
     }
-    log2(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
+    log3(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
     const trimmed = content.trim();
     if (trimmed === "/clear") {
       if (manager?.isSdkMode) {
@@ -2156,6 +2542,56 @@ async function processMessages(msgs, account, sessions, manager) {
         } catch (err) {
           logError2(`\u53D1\u9001 /help \u56DE\u590D\u5931\u8D25: ${String(err)}`);
         }
+      }
+      continue;
+    }
+    if (trimmed === "/loop" || trimmed.startsWith("/loop ")) {
+      const sub = trimmed.slice(5).trim();
+      const contextToken = getCachedContextToken(senderId);
+      let reply = "";
+      if (sub === "" || sub === "list") {
+        reply = Scheduler.formatTaskList(scheduler.list(senderId));
+      } else if (sub.startsWith("rm ") || sub.startsWith("del ")) {
+        const id = sub.slice(3).trim();
+        if (scheduler.remove(id)) {
+          reply = `\u5DF2\u5220\u9664\u4EFB\u52A1 ${id}`;
+        } else {
+          reply = `\u672A\u627E\u5230\u4EFB\u52A1 ${id}\uFF0C\u4F7F\u7528 /loop list \u67E5\u770B\u6240\u6709\u4EFB\u52A1`;
+        }
+      } else if (sub === "off") {
+        const count = scheduler.disableAll(senderId);
+        reply = count > 0 ? `\u5DF2\u6682\u505C ${count} \u4E2A\u4EFB\u52A1` : "\u6CA1\u6709\u9700\u8981\u6682\u505C\u7684\u4EFB\u52A1";
+      } else if (sub === "on") {
+        const count = scheduler.enableAll(senderId);
+        reply = count > 0 ? `\u5DF2\u6062\u590D ${count} \u4E2A\u4EFB\u52A1` : "\u6CA1\u6709\u9700\u8981\u6062\u590D\u7684\u4EFB\u52A1";
+      } else {
+        reply = `\u672A\u77E5\u547D\u4EE4: /loop ${sub}
+${HELP_TEXT}`;
+      }
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, reply, contextToken);
+        } catch (err) {
+          logError2(`\u53D1\u9001 /loop \u56DE\u590D\u5931\u8D25: ${String(err)}`);
+        }
+      }
+      continue;
+    }
+    if (hasLoopIntent(trimmed)) {
+      await typingManager.sendTyping(senderId, 1);
+      typingManager.startKeepalive(senderId);
+      try {
+        const { reply: loopReply } = await claudeReplyLoopMode(senderId, trimmed, sessions, account);
+        await typingManager.sendTyping(senderId, 2);
+        typingManager.stopKeepalive(senderId);
+        const contextToken = getCachedContextToken(senderId);
+        if (contextToken) {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, loopReply, contextToken);
+        }
+      } catch (err) {
+        logError2(`\u5904\u7406\u5B9A\u65F6\u610F\u56FE\u5931\u8D25: ${String(err)}`);
+        await typingManager.sendTyping(senderId, 2);
+        typingManager.stopKeepalive(senderId);
       }
       continue;
     }
@@ -2203,29 +2639,29 @@ async function startPolling(account, sessions, manager) {
   let emptyPollCount = 0;
   const syncBufFile = getSyncBufFile();
   try {
-    if (fs3.existsSync(syncBufFile)) {
-      getUpdatesBuf = fs3.readFileSync(syncBufFile, "utf-8");
-      log2(`\u6062\u590D\u4E0A\u6B21\u540C\u6B65\u72B6\u6001 (${getUpdatesBuf.length} bytes)`);
+    if (fs4.existsSync(syncBufFile)) {
+      getUpdatesBuf = fs4.readFileSync(syncBufFile, "utf-8");
+      log3(`\u6062\u590D\u4E0A\u6B21\u540C\u6B65\u72B6\u6001 (${getUpdatesBuf.length} bytes)`);
     }
   } catch (err) {
-    log2(`\u52A0\u8F7D\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
+    log3(`\u52A0\u8F7D\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
   }
   loadContextTokens();
   if (account.savedAt) {
     try {
       const ageMs = Date.now() - new Date(account.savedAt).getTime();
       const ageHours = Math.round(ageMs / 36e5);
-      log2(`\u51ED\u636E\u4FDD\u5B58\u4E8E ${account.savedAt}\uFF0C\u8DDD\u4ECA ${ageHours} \u5C0F\u65F6`);
+      log3(`\u51ED\u636E\u4FDD\u5B58\u4E8E ${account.savedAt}\uFF0C\u8DDD\u4ECA ${ageHours} \u5C0F\u65F6`);
     } catch {
     }
   }
-  log2(`channel_version: ${CHANNEL_VERSION}`);
-  log2("\u5F00\u59CB\u76D1\u542C\u5FAE\u4FE1\u6D88\u606F (\u72EC\u7ACB Bot \u6A21\u5F0F)...");
+  log3(`channel_version: ${CHANNEL_VERSION}`);
+  log3("\u5F00\u59CB\u76D1\u542C\u5FAE\u4FE1\u6D88\u606F (\u72EC\u7ACB Bot \u6A21\u5F0F)...");
   while (true) {
     try {
       const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
       const msgCount = resp.msgs?.length ?? 0;
-      log2(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
+      log3(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
       const isError = resp.ret !== void 0 && resp.ret !== 0 || resp.errcode !== void 0 && resp.errcode !== 0;
       if (isError) {
         if (resp.ret === -14 || resp.errcode === -14) {
@@ -2252,7 +2688,7 @@ async function startPolling(account, sessions, manager) {
       if (msgCount === 0) {
         emptyPollCount++;
         if (emptyPollCount % 10 === 0) {
-          log2(`\u5FC3\u8DF3: \u957F\u8F6E\u8BE2\u6B63\u5E38 (\u5DF2\u7A7A\u8F6E\u8BE2 ${emptyPollCount} \u6B21)`);
+          log3(`\u5FC3\u8DF3: \u957F\u8F6E\u8BE2\u6B63\u5E38 (\u5DF2\u7A7A\u8F6E\u8BE2 ${emptyPollCount} \u6B21)`);
         }
       } else {
         emptyPollCount = 0;
@@ -2261,13 +2697,13 @@ async function startPolling(account, sessions, manager) {
         const oldLen = getUpdatesBuf.length;
         getUpdatesBuf = resp.get_updates_buf;
         if (oldLen !== getUpdatesBuf.length) {
-          log2(`sync_buf \u66F4\u65B0: ${oldLen}b \u2192 ${getUpdatesBuf.length}b`);
+          log3(`sync_buf \u66F4\u65B0: ${oldLen}b \u2192 ${getUpdatesBuf.length}b`);
         }
         try {
-          fs3.mkdirSync(getCredentialsDir(), { recursive: true });
-          fs3.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
+          fs4.mkdirSync(getCredentialsDir(), { recursive: true });
+          fs4.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
         } catch (err) {
-          log2(`\u4FDD\u5B58\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
+          log3(`\u4FDD\u5B58\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
         }
       }
     } catch (err) {
@@ -2280,7 +2716,7 @@ async function main() {
     process2.exit(1);
   }
   let sessions = loadSessions();
-  log2(`\u52A0\u8F7D\u4F1A\u8BDD: ${Object.keys(sessions).length} \u4E2A\u7528\u6237`);
+  log3(`\u52A0\u8F7D\u4F1A\u8BDD: ${Object.keys(sessions).length} \u4E2A\u7528\u6237`);
   let account = null;
   const managerDeps = {
     sendMessage: async (to, text, contextToken) => {
@@ -2298,12 +2734,13 @@ async function main() {
   sessionManager = new SessionManager(managerDeps);
   const sdkMode = await sessionManager.probeSdk();
   if (sdkMode) {
-    log2("\u4F7F\u7528 Claude Agent SDK V2 \u6A21\u5F0F");
+    log3("\u4F7F\u7528 Claude Agent SDK V2 \u6A21\u5F0F");
   } else {
-    log2("\u4F7F\u7528 spawn \u6A21\u5F0F (claude -p \u5B50\u8FDB\u7A0B)");
+    log3("\u4F7F\u7528 spawn \u6A21\u5F0F (claude -p \u5B50\u8FDB\u7A0B)");
   }
   const cleanup = () => {
     typingManager.stopAll();
+    scheduler.stop();
     sessionManager?.closeAll();
     releaseLock();
     saveContextTokens();
@@ -2319,10 +2756,10 @@ async function main() {
   });
   account = loadCredentials();
   if (!account) {
-    log2("\u672A\u627E\u5230\u5DF2\u4FDD\u5B58\u7684\u51ED\u636E\uFF0C\u542F\u52A8\u5FAE\u4FE1\u626B\u7801\u767B\u5F55...");
-    log2("\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...");
+    log3("\u672A\u627E\u5230\u5DF2\u4FDD\u5B58\u7684\u51ED\u636E\uFF0C\u542F\u52A8\u5FAE\u4FE1\u626B\u7801\u767B\u5F55...");
+    log3("\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...");
     const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
-    log2("\n\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u4EE5\u4E0B\u4E8C\u7EF4\u7801\uFF1A\n");
+    log3("\n\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u4EE5\u4E0B\u4E8C\u7EF4\u7801\uFF1A\n");
     try {
       const qrterm = await Promise.resolve().then(() => __toESM(require_main(), 1));
       await new Promise((resolve) => {
@@ -2336,9 +2773,9 @@ async function main() {
         );
       });
     } catch {
-      log2(`\u4E8C\u7EF4\u7801\u94FE\u63A5: ${qrResp.qrcode_img_content}`);
+      log3(`\u4E8C\u7EF4\u7801\u94FE\u63A5: ${qrResp.qrcode_img_content}`);
     }
-    log2("\u7B49\u5F85\u626B\u7801...");
+    log3("\u7B49\u5F85\u626B\u7801...");
     const deadline = Date.now() + 48e4;
     let scannedPrinted = false;
     while (Date.now() < deadline) {
@@ -2348,12 +2785,12 @@ async function main() {
           break;
         case "scaned":
           if (!scannedPrinted) {
-            log2("\u5DF2\u626B\u7801\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4...");
+            log3("\u5DF2\u626B\u7801\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4...");
             scannedPrinted = true;
           }
           break;
         case "expired":
-          log2("\u4E8C\u7EF4\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u542F\u52A8\u3002");
+          log3("\u4E8C\u7EF4\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u542F\u52A8\u3002");
           process2.exit(1);
           break;
         case "confirmed": {
@@ -2370,7 +2807,7 @@ async function main() {
           };
           saveCredentials(confirmedAccount);
           account = confirmedAccount;
-          log2("\u5FAE\u4FE1\u8FDE\u63A5\u6210\u529F\uFF01");
+          log3("\u5FAE\u4FE1\u8FDE\u63A5\u6210\u529F\uFF01");
           break;
         }
       }
@@ -2382,9 +2819,24 @@ async function main() {
       process2.exit(1);
     }
   } else {
-    log2(`\u4F7F\u7528\u5DF2\u4FDD\u5B58\u8D26\u53F7: ${account.accountId}`);
+    log3(`\u4F7F\u7528\u5DF2\u4FDD\u5B58\u8D26\u53F7: ${account.accountId}`);
   }
   typingManager.configure(account.accountId, account.token, account.baseUrl);
+  scheduler.load();
+  scheduler.onFire(async (task) => {
+    const contextToken = getCachedContextToken(task.senderId);
+    if (contextToken) {
+      try {
+        log3(`[scheduler] \u53D1\u9001\u5B9A\u65F6\u63D0\u9192: ${task.id} \u2192 ${task.senderId}`);
+        await sendTextMessageWithRetry(account.baseUrl, account.token, task.senderId, `\u23F0 ${task.message}`, contextToken);
+      } catch (err) {
+        logError2(`[scheduler] \u53D1\u9001\u5B9A\u65F6\u63D0\u9192\u5931\u8D25: ${String(err)}`);
+      }
+    } else {
+      logError2(`[scheduler] \u65E0\u6CD5\u53D1\u9001\u63D0\u9192 ${task.id}: \u7F3A\u5C11 context_token`);
+    }
+  });
+  scheduler.start(3e4);
   await startPolling(account, sessions, sessionManager);
 }
 main().catch((err) => {
