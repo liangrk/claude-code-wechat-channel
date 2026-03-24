@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * Claude Code WeChat Channel — CLI entry point
+ * Claude Code WeChat Bot — CLI entry point
  *
  * Usage:
  *   npx claude-code-wechat-channel setup   — WeChat QR login
- *   npx claude-code-wechat-channel start   — Start channel server (used by .mcp.json)
- *   npx claude-code-wechat-channel install — Write .mcp.json to current directory
+ *   npx claude-code-wechat-channel bot     — Start standalone bot mode
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, writeFileSync, readFileSync, renameSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
@@ -175,9 +174,9 @@ async function status() {
     console.log(`Status: OK (${latency}ms)`);
     console.log("  API is reachable and session is valid.");
     console.log("");
-    console.log("The WeChat channel is ready to use.");
-    console.log("If messages aren't being received by Claude Code, check:");
-    console.log("  1. Claude Code is running with MCP connected");
+    console.log("The WeChat bot is ready to use.");
+    console.log("If messages aren't being received, check:");
+    console.log("  1. Bot process is running (npx claude-code-wechat-channel bot)");
     console.log("  2. Messages are sent to the ClawBot in WeChat");
   } catch (err) {
     const elapsed = Date.now() - start;
@@ -201,60 +200,16 @@ async function status() {
   }
 }
 
-function install() {
-  const mcpConfig = {
-    mcpServers: {
-      wechat: {
-        command: "npx",
-        args: ["-y", "@liangrk/claude-code-wechatbot", "start"],
-      },
-    },
-  };
-
-  const mcpPath = resolve(process.cwd(), ".mcp.json");
-  const tmpPath = mcpPath + ".tmp";
-
-  function atomicWrite(filePath, content) {
-    writeFileSync(tmpPath, content, "utf-8");
-    renameSync(tmpPath, filePath);
-  }
-
-  if (existsSync(mcpPath)) {
-    try {
-      const existing = JSON.parse(readFileSync(mcpPath, "utf-8"));
-      existing.mcpServers = existing.mcpServers || {};
-      existing.mcpServers.wechat = mcpConfig.mcpServers.wechat;
-      atomicWrite(mcpPath, JSON.stringify(existing, null, 2) + "\n");
-      console.log(`Updated: ${mcpPath}`);
-    } catch (err) {
-      console.error(`Warning: Failed to update existing .mcp.json: ${err}`);
-      atomicWrite(mcpPath, JSON.stringify(mcpConfig, null, 2) + "\n");
-      console.log(`Created: ${mcpPath}`);
-    }
-  } else {
-    atomicWrite(mcpPath, JSON.stringify(mcpConfig, null, 2) + "\n");
-    console.log(`Created: ${mcpPath}`);
-  }
-
-  console.log(`
-Next steps:
-  1. Run: npx claude-code-wechat-channel setup
-  2. Then: claude --dangerously-load-development-channels server:wechat
-`);
-}
-
 function help() {
   console.log(`
-  Claude Code WeChat Channel
+  Claude Code WeChat Bot
 
   Usage: npx claude-code-wechat-channel <command>
 
   Commands:
     setup     WeChat QR login (scan to authenticate)
-    start     Start the channel MCP server (requires OAuth)
     bot       Start standalone bot mode (works with any API key)
     status    Check account and API connectivity
-    install   Write .mcp.json to current directory
     help      Show this help message
 `);
 }
@@ -265,17 +220,11 @@ switch (command) {
   case "setup":
     runScript("setup.js");
     break;
-  case "start":
-    runScript("wechat-channel.js");
-    break;
   case "bot":
     runScript("wechat-bot.js");
     break;
   case "status":
     status();
-    break;
-  case "install":
-    install();
     break;
   case "help":
   case "--help":

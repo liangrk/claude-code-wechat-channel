@@ -1,7 +1,7 @@
 {
   "name": "@liangrk/claude-code-wechatbot",
   "version": "0.4.0",
-  "description": "Claude Code Channel plugin for WeChat — bridge WeChat messages into Claude Code sessions via the official ilink API",
+  "description": "WeChat Bot for Claude Code — bridge WeChat messages to Claude Code via the official ilink API",
   "type": "module",
   "bin": {
     "claude-code-wechat-channel": "cli.mjs"
@@ -13,13 +13,15 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "esbuild wechat-channel.ts --bundle --platform=node --format=esm --outfile=dist/wechat-channel.js && esbuild setup.ts --bundle --platform=node --format=esm --outfile=dist/setup.js && esbuild wechat-bot.ts --bundle --platform=node --format=esm --outfile=dist/wechat-bot.js",
+    "build": "esbuild setup.ts --bundle --platform=node --format=esm --outfile=dist/setup.js && esbuild wechat-bot.ts --bundle --platform=node --format=esm --external:@anthropic-ai/claude-agent-sdk --outfile=dist/wechat-bot.js",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
     "qrcode-terminal": "^0.12.0"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -37,7 +39,7 @@
   "keywords": [
     "claude-code",
     "wechat",
-    "mcp",
+    "bot",
     "channel",
     "clawbot",
     "ai-agent"

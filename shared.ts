@@ -1,6 +1,6 @@
 /**
  * shared.ts — Shared types, constants, and utility functions
- * for both wechat-channel.ts and setup.ts.
+ * for both wechat-bot.ts and setup.ts.
  */
 
 import crypto from "node:crypto";
@@ -122,6 +122,10 @@ export function getContextTokensFile(): string {
 
 export function getLockPidFile(): string {
   return path.join(getCredentialsDir(), "lock.pid");
+}
+
+export function getSessionsFile(): string {
+  return path.join(getCredentialsDir(), "sessions.json");
 }
 
 // ── Credentials I/O ─────────────────────────────────────────────────────────

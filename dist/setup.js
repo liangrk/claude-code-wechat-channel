@@ -1240,9 +1240,9 @@ async function main() {
         console.log(`   \u7528\u6237 ID: ${account.userId}`);
         console.log(`   \u51ED\u636E\u4FDD\u5B58\u81F3: ${getCredentialsFile()}`);
         console.log();
-        console.log("\u73B0\u5728\u53EF\u4EE5\u542F\u52A8 Claude Code \u901A\u9053\uFF1A");
+        console.log("\u73B0\u5728\u53EF\u4EE5\u542F\u52A8 Bot\uFF1A");
         console.log(
-          "  claude --dangerously-skip-permissions"
+          "  npx claude-code-wechat-channel bot"
         );
         process.exit(0);
       }

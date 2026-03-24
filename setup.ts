@@ -110,9 +110,9 @@ async function main() {
         console.log(`   用户 ID: ${account.userId}`);
         console.log(`   凭据保存至: ${getCredentialsFile()}`);
         console.log();
-        console.log("现在可以启动 Claude Code 通道：");
+        console.log("现在可以启动 Bot：");
         console.log(
-          "  claude --dangerously-skip-permissions",
+          "  npx claude-code-wechat-channel bot",
         );
         process.exit(0);
       }

@@ -1097,7 +1097,7 @@ var require_main = __commonJS({
 
 // wechat-bot.ts
 import crypto3 from "node:crypto";
-import fs2 from "node:fs";
+import fs3 from "node:fs";
 import path2 from "node:path";
 import process2 from "node:process";
 import { spawn, execSync } from "node:child_process";
@@ -1137,6 +1137,9 @@ function getContextTokensFile() {
 }
 function getLockPidFile() {
   return path.join(getCredentialsDir(), "lock.pid");
+}
+function getSessionsFile() {
+  return path.join(getCredentialsDir(), "sessions.json");
 }
 function loadCredentials() {
   try {
@@ -1390,6 +1393,313 @@ async function downloadAndDecryptBuffer(media) {
 }
 var MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024;
 
+// session-manager.ts
+import fs2 from "node:fs";
+var IDLE_TIMEOUT_MS = 30 * 60 * 1e3;
+var SDK_REPLY_TIMEOUT_MS = 12e4;
+var DEFAULT_MODEL = "claude-sonnet-4-6";
+function log(msg) {
+  process.stderr.write(`[session-manager] ${msg}
+`);
+}
+function logError(msg) {
+  process.stderr.write(`[session-manager] ERROR: ${msg}
+`);
+}
+var SessionManager = class {
+  sessions = /* @__PURE__ */ new Map();
+  records = /* @__PURE__ */ new Map();
+  idleTimer = null;
+  saveTimer = null;
+  recordsDirty = false;
+  sdkAvailable = false;
+  sdkModule = null;
+  deps;
+  model;
+  maxTurns;
+  constructor(deps, options) {
+    this.deps = deps;
+    this.model = options?.model || process.env.CLAUDE_MODEL || DEFAULT_MODEL;
+    this.maxTurns = options?.maxTurns ?? parseInt(process.env.CLAUDE_MAX_TURNS || "5", 10);
+    this.loadRecords();
+  }
+  // ── SDK probe ───────────────────────────────────────────────────────────
+  async probeSdk() {
+    if (process.env.CLAUDE_SDK_MODE === "spawn") {
+      log("CLAUDE_SDK_MODE=spawn\uFF0C\u5F3A\u5236\u4F7F\u7528 spawn \u6A21\u5F0F");
+      return false;
+    }
+    try {
+      this.sdkModule = await import("@anthropic-ai/claude-agent-sdk");
+      if (typeof this.sdkModule.unstable_v2_createSession === "function") {
+        this.sdkAvailable = true;
+        this.startIdleTimer();
+        log(`\u4F7F\u7528 Claude Agent SDK V2 \u6A21\u5F0F (model=${this.model}, maxTurns=${this.maxTurns})`);
+        return true;
+      }
+      log("SDK \u4E0D\u5305\u542B V2 API\uFF0C\u56DE\u9000\u5230 spawn \u6A21\u5F0F");
+      return false;
+    } catch (err) {
+      log(`SDK \u672A\u5B89\u88C5\u6216\u52A0\u8F7D\u5931\u8D25\uFF0C\u56DE\u9000\u5230 spawn \u6A21\u5F0F: ${String(err)}`);
+      return false;
+    }
+  }
+  get isSdkMode() {
+    return this.sdkAvailable;
+  }
+  // ── Core: send message and get reply ────────────────────────────────────
+  async sendMessage(senderId, content) {
+    if (!this.sdkAvailable) {
+      throw new Error("SDK not available");
+    }
+    let entry;
+    try {
+      entry = await this.getOrCreateSession(senderId);
+    } catch (err) {
+      logError(`\u521B\u5EFA/\u6062\u590D session \u5931\u8D25: ${String(err)}`);
+      return "\u62B1\u6B49\uFF0C\u5904\u7406\u6D88\u606F\u65F6\u51FA\u73B0\u4E86\u95EE\u9898\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002";
+    }
+    const senderName = senderId.split("@")[0] || senderId;
+    const prompt = `[\u5FAE\u4FE1\u6D88\u606F] \u6765\u81EA: ${senderName}
+${content}
+
+\u8BF7\u7528\u4E2D\u6587\u56DE\u590D\uFF0C\u4E0D\u8981\u4F7F\u7528 Markdown \u683C\u5F0F\u3002`;
+    try {
+      await entry.session.send(prompt);
+    } catch (err) {
+      logError(`session.send \u5931\u8D25: ${String(err)}`);
+      this.destroySession(senderId);
+      return "\u62B1\u6B49\uFF0C\u53D1\u9001\u6D88\u606F\u5230 Claude \u5931\u8D25\u4E86\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002";
+    }
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("timeout")), SDK_REPLY_TIMEOUT_MS);
+    });
+    try {
+      const reply = await Promise.race([
+        this.collectReply(entry.session, senderId),
+        timeoutPromise
+      ]);
+      clearTimeout(timer);
+      entry.lastUsedAt = Date.now();
+      this.updateRecord(senderId, entry.sessionId);
+      log(`SDK \u56DE\u590D (${senderId}): ${reply.slice(0, 80)}...`);
+      return reply;
+    } catch (err) {
+      clearTimeout(timer);
+      if (err instanceof Error && err.message === "timeout") {
+        logError(`SDK \u56DE\u590D\u8D85\u65F6 (${SDK_REPLY_TIMEOUT_MS / 1e3}s)`);
+      } else {
+        logError(`stream \u5F02\u5E38: ${String(err)}`);
+      }
+      this.destroySession(senderId);
+      return "\u62B1\u6B49\uFF0C\u5904\u7406\u6D88\u606F\u65F6\u51FA\u73B0\u4E86\u95EE\u9898\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002";
+    }
+  }
+  // ── Stream collection ──────────────────────────────────────────────────
+  async collectReply(session, senderId) {
+    const textParts = [];
+    for await (const msg of session.stream()) {
+      if (msg.session_id) {
+        const entry = this.sessions.get(senderId);
+        if (entry && entry.sessionId !== msg.session_id) {
+          entry.sessionId = msg.session_id;
+          this.updateRecord(senderId, msg.session_id);
+        }
+      }
+      if (msg.type === "assistant" && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === "text" && block.text) {
+            textParts.push(block.text);
+          }
+        }
+      }
+      if (msg.type === "control_request") {
+        log(`control_request \u4E8B\u4EF6 (senderId=${senderId})`);
+      }
+    }
+    return textParts.join("") || "\uFF08\u65E0\u56DE\u590D\u5185\u5BB9\uFF09";
+  }
+  // ── Session lifecycle ───────────────────────────────────────────────────
+  async getOrCreateSession(senderId) {
+    const active = this.sessions.get(senderId);
+    if (active) {
+      active.lastUsedAt = Date.now();
+      return active;
+    }
+    const record = this.records.get(senderId);
+    if (record?.sessionId) {
+      try {
+        const entry = this.resumeSession(senderId, record.sessionId);
+        return entry;
+      } catch (err) {
+        log(`\u6062\u590D session \u5931\u8D25: ${String(err)}\uFF0C\u521B\u5EFA\u65B0 session`);
+        this.records.delete(senderId);
+        this.markRecordsDirty();
+      }
+    }
+    return this.createSession(senderId);
+  }
+  createSession(senderId) {
+    const sessionOpts = {
+      model: this.model,
+      maxTurns: this.maxTurns,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      env: this.buildEnv()
+    };
+    const session = this.sdkModule.unstable_v2_createSession(sessionOpts);
+    const entry = {
+      session,
+      sessionId: session.sessionId,
+      lastUsedAt: Date.now()
+    };
+    this.sessions.set(senderId, entry);
+    this.updateRecord(senderId, session.sessionId);
+    log(`\u521B\u5EFA\u65B0 SDK session: ${senderId} \u2192 ${session.sessionId.slice(0, 8)}...`);
+    return entry;
+  }
+  resumeSession(senderId, sessionId) {
+    const sessionOpts = {
+      model: this.model,
+      maxTurns: this.maxTurns,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      env: this.buildEnv()
+    };
+    const session = this.sdkModule.unstable_v2_resumeSession(
+      sessionId,
+      sessionOpts
+    );
+    const entry = {
+      session,
+      sessionId,
+      lastUsedAt: Date.now()
+    };
+    this.sessions.set(senderId, entry);
+    this.updateRecord(senderId, sessionId);
+    log(`\u6062\u590D session (\u5DF2\u4FDD\u7559\u4E0A\u4E0B\u6587): ${senderId} \u2192 ${sessionId.slice(0, 8)}...`);
+    return entry;
+  }
+  destroySession(senderId) {
+    const entry = this.sessions.get(senderId);
+    if (entry) {
+      try {
+        entry.session.close();
+      } catch {
+      }
+      this.sessions.delete(senderId);
+    }
+  }
+  async clearSession(senderId) {
+    this.destroySession(senderId);
+    this.records.delete(senderId);
+    this.markRecordsDirty();
+  }
+  async closeAll() {
+    for (const [senderId] of this.sessions) {
+      this.destroySession(senderId);
+    }
+    this.sessions.clear();
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
+    this.flushRecords();
+  }
+  // ── Idle timeout ───────────────────────────────────────────────────────
+  startIdleTimer() {
+    if (this.idleTimer) clearInterval(this.idleTimer);
+    this.idleTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [senderId, entry] of this.sessions) {
+        if (now - entry.lastUsedAt > IDLE_TIMEOUT_MS) {
+          try {
+            entry.session.close();
+          } catch {
+          }
+          this.sessions.delete(senderId);
+          log(`session \u7A7A\u95F2\u5173\u95ED\uFF0C\u4E0A\u4E0B\u6587\u5DF2\u4FDD\u7559: ${senderId}`);
+        }
+      }
+    }, 6e4);
+  }
+  // ── Env construction ───────────────────────────────────────────────────
+  buildEnv() {
+    const env = {};
+    if (process.env.ANTHROPIC_API_KEY) {
+      env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+    }
+    if (process.env.ANTHROPIC_BASE_URL) {
+      env.ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL;
+    }
+    return env;
+  }
+  // ── Persistence (debounced writes) ─────────────────────────────────────
+  loadRecords() {
+    try {
+      const file = getSessionsFile();
+      if (!fs2.existsSync(file)) return;
+      const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
+      for (const [key, value] of Object.entries(data)) {
+        if (typeof value === "string") {
+          log(`\u8FC1\u79FB\u65E7\u683C\u5F0F session \u8BB0\u5F55: ${key}`);
+          continue;
+        }
+        const record = value;
+        if (record.sessionId) {
+          this.records.set(key, record);
+        }
+      }
+      log(`\u52A0\u8F7D session \u8BB0\u5F55: ${this.records.size} \u6761`);
+    } catch (err) {
+      logError(`\u52A0\u8F7D session \u8BB0\u5F55\u5931\u8D25: ${String(err)}`);
+    }
+  }
+  markRecordsDirty() {
+    if (this.recordsDirty) return;
+    this.recordsDirty = true;
+    this.saveTimer = setTimeout(() => {
+      this.flushRecords();
+    }, 2e3);
+  }
+  flushRecords() {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    if (!this.recordsDirty) return;
+    this.recordsDirty = false;
+    this.saveRecordsNow();
+  }
+  saveRecordsNow() {
+    try {
+      const dir = getCredentialsDir();
+      const file = getSessionsFile();
+      fs2.mkdirSync(dir, { recursive: true });
+      const data = {};
+      for (const [key, record] of this.records) {
+        data[key] = record;
+      }
+      fs2.writeFileSync(file, JSON.stringify(data), "utf-8");
+      try {
+        fs2.chmodSync(file, 384);
+      } catch {
+      }
+    } catch {
+    }
+  }
+  updateRecord(senderId, sessionId) {
+    const existing = this.records.get(senderId);
+    this.records.set(senderId, {
+      sessionId,
+      createdAt: existing?.createdAt || Date.now(),
+      lastUsedAt: Date.now()
+    });
+    this.markRecordsDirty();
+  }
+};
+
 // wechat-bot.ts
 var MAX_CONSECUTIVE_FAILURES = 3;
 var MAX_REPLY_LENGTH = 4096;
@@ -1400,11 +1710,11 @@ var CONTEXT_TOKEN_TTL_MS = 24 * 60 * 60 * 1e3;
 var LONG_POLL_TIMEOUT_MIN_MS = 1e4;
 var LONG_POLL_TIMEOUT_MAX_MS = 6e4;
 var CLAUDE_TIMEOUT_MS = 12e4;
-function log(msg) {
+function log2(msg) {
   process2.stderr.write(`[wechat-bot] ${msg}
 `);
 }
-function logError(msg) {
+function logError2(msg) {
   process2.stderr.write(`[wechat-bot] ERROR: ${msg}
 `);
 }
@@ -1415,15 +1725,15 @@ var contextTokenCache = /* @__PURE__ */ new Map();
 function loadContextTokens() {
   try {
     const file = getContextTokensFile();
-    if (!fs2.existsSync(file)) return;
-    const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
+    if (!fs3.existsSync(file)) return;
+    const data = JSON.parse(fs3.readFileSync(file, "utf-8"));
     const now = Date.now();
     for (const [key, entry] of Object.entries(data)) {
       if (now - entry.ts < CONTEXT_TOKEN_TTL_MS) {
         contextTokenCache.set(key, { token: entry.token, lastAccessed: entry.ts });
       }
     }
-    log(`\u52A0\u8F7D context_token \u7F13\u5B58: ${contextTokenCache.size} \u6761`);
+    log2(`\u52A0\u8F7D context_token \u7F13\u5B58: ${contextTokenCache.size} \u6761`);
   } catch {
   }
 }
@@ -1431,14 +1741,14 @@ function saveContextTokens() {
   try {
     const dir = getCredentialsDir();
     const file = getContextTokensFile();
-    fs2.mkdirSync(dir, { recursive: true });
+    fs3.mkdirSync(dir, { recursive: true });
     const data = {};
     for (const [key, entry] of contextTokenCache.entries()) {
       data[key] = { token: entry.token, ts: entry.lastAccessed };
     }
-    fs2.writeFileSync(file, JSON.stringify(data), "utf-8");
+    fs3.writeFileSync(file, JSON.stringify(data), "utf-8");
     try {
-      fs2.chmodSync(file, 384);
+      fs3.chmodSync(file, 384);
     } catch {
     }
   } catch {
@@ -1479,8 +1789,8 @@ function getCachedContextToken(userId) {
 var SESSIONS_FILE = path2.join(getCredentialsDir(), "sessions.json");
 function loadSessions() {
   try {
-    if (!fs2.existsSync(SESSIONS_FILE)) return {};
-    return JSON.parse(fs2.readFileSync(SESSIONS_FILE, "utf-8"));
+    if (!fs3.existsSync(SESSIONS_FILE)) return {};
+    return JSON.parse(fs3.readFileSync(SESSIONS_FILE, "utf-8"));
   } catch {
     return {};
   }
@@ -1488,10 +1798,10 @@ function loadSessions() {
 function saveSessions(sessions) {
   try {
     const dir = getCredentialsDir();
-    fs2.mkdirSync(dir, { recursive: true });
-    fs2.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions), "utf-8");
+    fs3.mkdirSync(dir, { recursive: true });
+    fs3.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions), "utf-8");
     try {
-      fs2.chmodSync(SESSIONS_FILE, 384);
+      fs3.chmodSync(SESSIONS_FILE, 384);
     } catch {
     }
   } catch {
@@ -1504,7 +1814,7 @@ function clearSession(sessions, senderId) {
 var LOCK_STALE_TIMEOUT_MS = 10 * 60 * 1e3;
 function getLockFileAge(lockFile) {
   try {
-    const stat = fs2.statSync(lockFile);
+    const stat = fs3.statSync(lockFile);
     return Date.now() - stat.mtimeMs;
   } catch {
     return Infinity;
@@ -1523,57 +1833,57 @@ function isLikelyWechatBot(pid) {
 function acquireLock() {
   const lockFile = getLockPidFile();
   try {
-    fs2.mkdirSync(getCredentialsDir(), { recursive: true });
+    fs3.mkdirSync(getCredentialsDir(), { recursive: true });
     try {
-      const fd = fs2.openSync(lockFile, "wx");
-      fs2.writeSync(fd, String(process2.pid));
-      fs2.closeSync(fd);
+      const fd = fs3.openSync(lockFile, "wx");
+      fs3.writeSync(fd, String(process2.pid));
+      fs3.closeSync(fd);
       return true;
     } catch (err) {
       if (err.code === "EEXIST") {
         try {
-          const existingPid = parseInt(fs2.readFileSync(lockFile, "utf-8").trim(), 10);
+          const existingPid = parseInt(fs3.readFileSync(lockFile, "utf-8").trim(), 10);
           if (!isNaN(existingPid)) {
             process2.kill(existingPid, 0);
             const age = getLockFileAge(lockFile);
             if (age > LOCK_STALE_TIMEOUT_MS) {
-              log(`\u9501\u6587\u4EF6\u5DF2\u8FC7\u671F (${Math.round(age / 6e4)} \u5206\u949F\u524D\u521B\u5EFA)\uFF0C\u5C1D\u8BD5\u6E05\u7406...`);
+              log2(`\u9501\u6587\u4EF6\u5DF2\u8FC7\u671F (${Math.round(age / 6e4)} \u5206\u949F\u524D\u521B\u5EFA)\uFF0C\u5C1D\u8BD5\u6E05\u7406...`);
             } else if (isLikelyWechatBot(existingPid)) {
-              logError(`\u53E6\u4E00\u4E2A\u5B9E\u4F8B\u5DF2\u5728\u8FD0\u884C (PID ${existingPid})\uFF0C\u9000\u51FA\u3002`);
+              logError2(`\u53E6\u4E00\u4E2A\u5B9E\u4F8B\u5DF2\u5728\u8FD0\u884C (PID ${existingPid})\uFF0C\u9000\u51FA\u3002`);
               return false;
             } else {
-              log(`PID ${existingPid} \u5B58\u6D3B\u4F46\u4E0D\u662F wechat \u8FDB\u7A0B (\u53EF\u80FD PID \u590D\u7528)\uFF0C\u6E05\u7406\u9501\u6587\u4EF6...`);
+              log2(`PID ${existingPid} \u5B58\u6D3B\u4F46\u4E0D\u662F wechat \u8FDB\u7A0B (\u53EF\u80FD PID \u590D\u7528)\uFF0C\u6E05\u7406\u9501\u6587\u4EF6...`);
             }
           }
         } catch {
         }
         try {
-          fs2.unlinkSync(lockFile);
-          const fd = fs2.openSync(lockFile, "wx");
-          fs2.writeSync(fd, String(process2.pid));
-          fs2.closeSync(fd);
-          log("\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6\u5E76\u91CD\u65B0\u83B7\u53D6\u9501");
+          fs3.unlinkSync(lockFile);
+          const fd = fs3.openSync(lockFile, "wx");
+          fs3.writeSync(fd, String(process2.pid));
+          fs3.closeSync(fd);
+          log2("\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6\u5E76\u91CD\u65B0\u83B7\u53D6\u9501");
           return true;
         } catch {
-          logError("\u65E0\u6CD5\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6");
+          logError2("\u65E0\u6CD5\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6");
           return false;
         }
       }
-      logError(`\u65E0\u6CD5\u521B\u5EFA\u9501\u6587\u4EF6: ${String(err)}`);
+      logError2(`\u65E0\u6CD5\u521B\u5EFA\u9501\u6587\u4EF6: ${String(err)}`);
       return false;
     }
   } catch (err) {
-    logError(`\u65E0\u6CD5\u83B7\u53D6\u9501\u6587\u4EF6: ${String(err)}`);
+    logError2(`\u65E0\u6CD5\u83B7\u53D6\u9501\u6587\u4EF6: ${String(err)}`);
     return false;
   }
 }
 function releaseLock() {
   try {
     const lockFile = getLockPidFile();
-    if (fs2.existsSync(lockFile)) {
-      const pid = fs2.readFileSync(lockFile, "utf-8").trim();
+    if (fs3.existsSync(lockFile)) {
+      const pid = fs3.readFileSync(lockFile, "utf-8").trim();
       if (pid === String(process2.pid)) {
-        fs2.unlinkSync(lockFile);
+        fs3.unlinkSync(lockFile);
       }
     }
   } catch {
@@ -1581,7 +1891,7 @@ function releaseLock() {
 }
 function truncateText(text, maxLen = MAX_REPLY_LENGTH) {
   if (text.length <= maxLen) return text;
-  log(`\u6D88\u606F\u8D85\u957F (${text.length} \u5B57\u7B26)\uFF0C\u622A\u65AD\u81F3 ${maxLen}`);
+  log2(`\u6D88\u606F\u8D85\u957F (${text.length} \u5B57\u7B26)\uFF0C\u622A\u65AD\u81F3 ${maxLen}`);
   return text.slice(0, maxLen);
 }
 async function extractContentFromMessage(msg) {
@@ -1706,14 +2016,14 @@ async function sendTextMessageWithRetry(baseUrl, token, to, text, contextToken) 
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt < SEND_RETRY_COUNT) {
-        log(`\u53D1\u9001\u5931\u8D25 (\u7B2C ${attempt + 1} \u6B21)\uFF0C${SEND_RETRY_DELAY_MS / 1e3}s \u540E\u91CD\u8BD5...`);
+        log2(`\u53D1\u9001\u5931\u8D25 (\u7B2C ${attempt + 1} \u6B21)\uFF0C${SEND_RETRY_DELAY_MS / 1e3}s \u540E\u91CD\u8BD5...`);
         await new Promise((r) => setTimeout(r, SEND_RETRY_DELAY_MS));
       }
     }
   }
   throw lastError;
 }
-async function claudeReply(senderId, content, sessions, account) {
+async function claudeReplySpawn(senderId, content, sessions, account) {
   const sessionId = sessions[senderId];
   const senderName = senderId.split("@")[0] || senderId;
   const prompt = `[\u5FAE\u4FE1\u6D88\u606F] \u6765\u81EA: ${senderName}
@@ -1732,7 +2042,7 @@ ${content}
   if (sessionId) {
     args.unshift("--resume", sessionId);
   }
-  log(`\u8C03\u7528 claude ${sessionId ? `--resume ${sessionId.slice(0, 8)}...` : "(\u65B0\u4F1A\u8BDD)"} \u2014 ${content.slice(0, 50)}...`);
+  log2(`\u8C03\u7528 claude ${sessionId ? `--resume ${sessionId.slice(0, 8)}...` : "(\u65B0\u4F1A\u8BDD)"} \u2014 ${content.slice(0, 50)}...`);
   return new Promise((resolve) => {
     const child = spawn("claude", args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -1751,14 +2061,14 @@ ${content}
     });
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
-      logError(`claude -p \u8D85\u65F6 (${CLAUDE_TIMEOUT_MS / 1e3}s)`);
+      logError2(`claude -p \u8D85\u65F6 (${CLAUDE_TIMEOUT_MS / 1e3}s)`);
       resolve("\u62B1\u6B49\uFF0C\u56DE\u590D\u8D85\u65F6\u4E86\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002");
     }, CLAUDE_TIMEOUT_MS);
     child.on("close", (code) => {
       clearTimeout(timeout);
       if (code !== 0 || !stdout.trim()) {
         const errSnippet = stderr.slice(0, 200) || `exit code ${code}`;
-        logError(`claude -p \u5931\u8D25: ${errSnippet}`);
+        logError2(`claude -p \u5931\u8D25: ${errSnippet}`);
         resolve("\u62B1\u6B49\uFF0C\u5904\u7406\u6D88\u606F\u65F6\u51FA\u73B0\u4E86\u95EE\u9898\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002");
         return;
       }
@@ -1768,22 +2078,29 @@ ${content}
         if (!sessionId && result.session_id) {
           sessions[senderId] = result.session_id;
           saveSessions(sessions);
-          log(`\u4FDD\u5B58\u65B0\u4F1A\u8BDD: ${senderId} \u2192 ${result.session_id.slice(0, 8)}...`);
+          log2(`\u4FDD\u5B58\u65B0\u4F1A\u8BDD: ${senderId} \u2192 ${result.session_id.slice(0, 8)}...`);
         }
-        log(`claude \u56DE\u590D: ${reply.slice(0, 80)}...`);
+        log2(`claude \u56DE\u590D: ${reply.slice(0, 80)}...`);
         resolve(reply);
       } catch {
         const rawReply = stdout.trim().slice(0, MAX_REPLY_LENGTH);
-        log(`claude \u56DE\u590D (raw): ${rawReply.slice(0, 80)}...`);
+        log2(`claude \u56DE\u590D (raw): ${rawReply.slice(0, 80)}...`);
         resolve(rawReply);
       }
     });
     child.on("error", (err) => {
       clearTimeout(timeout);
-      logError(`claude -p \u542F\u52A8\u5931\u8D25: ${err.message}`);
+      logError2(`claude -p \u542F\u52A8\u5931\u8D25: ${err.message}`);
       resolve("\u62B1\u6B49\uFF0CClaude Code \u672A\u5B89\u88C5\u6216\u65E0\u6CD5\u542F\u52A8\u3002\u8BF7\u786E\u4FDD claude \u547D\u4EE4\u53EF\u7528\u3002");
     });
   });
+}
+var sessionManager = null;
+async function claudeReply(senderId, content, sessions, account) {
+  if (sessionManager?.isSdkMode) {
+    return sessionManager.sendMessage(senderId, content);
+  }
+  return claudeReplySpawn(senderId, content, sessions, account);
 }
 var HELP_TEXT = [
   "\u53EF\u7528\u547D\u4EE4\uFF1A",
@@ -1798,11 +2115,11 @@ function computeBackoffMs(failures) {
   return Math.min(base + jitter, 6e4);
 }
 var typingManager = new TypingManager();
-async function processMessages(msgs, account, sessions) {
+async function processMessages(msgs, account, sessions, manager) {
   for (const msg of msgs ?? []) {
     const senderId = msg.from_user_id ?? "unknown";
     const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
-    log(`\u5165\u7AD9\u6D88\u606F: from=${senderId} msg_type=${msg.message_type} items=[${types}]`);
+    log2(`\u5165\u7AD9\u6D88\u606F: from=${senderId} msg_type=${msg.message_type} items=[${types}]`);
     if (msg.message_type !== MSG_TYPE_USER) continue;
     if (msg.context_token) {
       cacheContextToken(senderId, msg.context_token);
@@ -1810,19 +2127,23 @@ async function processMessages(msgs, account, sessions) {
     const content = await extractContentFromMessage(msg);
     if (!content) {
       const itemTypes = msg.item_list?.map((i) => i.type).join(",") ?? "none";
-      log(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${itemTypes}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
+      log2(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${itemTypes}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
       continue;
     }
-    log(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
+    log2(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
     const trimmed = content.trim();
     if (trimmed === "/clear") {
-      clearSession(sessions, senderId);
+      if (manager?.isSdkMode) {
+        await manager.clearSession(senderId);
+      } else {
+        clearSession(sessions, senderId);
+      }
       const contextToken = getCachedContextToken(senderId);
       if (contextToken) {
         try {
           await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, "\u4E0A\u4E0B\u6587\u5DF2\u6E05\u7A7A\uFF0C\u4E0B\u6B21\u6D88\u606F\u5C06\u5F00\u59CB\u65B0\u4F1A\u8BDD\u3002", contextToken);
         } catch (err) {
-          logError(`\u53D1\u9001 /clear \u56DE\u590D\u5931\u8D25: ${String(err)}`);
+          logError2(`\u53D1\u9001 /clear \u56DE\u590D\u5931\u8D25: ${String(err)}`);
         }
       }
       continue;
@@ -1833,7 +2154,7 @@ async function processMessages(msgs, account, sessions) {
         try {
           await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, HELP_TEXT, contextToken);
         } catch (err) {
-          logError(`\u53D1\u9001 /help \u56DE\u590D\u5931\u8D25: ${String(err)}`);
+          logError2(`\u53D1\u9001 /help \u56DE\u590D\u5931\u8D25: ${String(err)}`);
         }
       }
       continue;
@@ -1848,10 +2169,10 @@ async function processMessages(msgs, account, sessions) {
       if (contextToken) {
         await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, reply, contextToken);
       } else {
-        logError(`\u65E0\u6CD5\u56DE\u590D ${senderId}: \u7F3A\u5C11 context_token`);
+        logError2(`\u65E0\u6CD5\u56DE\u590D ${senderId}: \u7F3A\u5C11 context_token`);
       }
     } catch (err) {
-      logError(`\u5904\u7406\u6D88\u606F\u5931\u8D25: ${String(err)}`);
+      logError2(`\u5904\u7406\u6D88\u606F\u5931\u8D25: ${String(err)}`);
       await typingManager.sendTyping(senderId, 2);
       typingManager.stopKeepalive(senderId);
       const contextToken = getCachedContextToken(senderId);
@@ -1866,15 +2187,15 @@ async function processMessages(msgs, account, sessions) {
 }
 async function handlePollError(err, consecutiveFailures) {
   consecutiveFailures++;
-  logError(`\u8F6E\u8BE2\u5F02\u5E38: ${String(err)}`);
+  logError2(`\u8F6E\u8BE2\u5F02\u5E38: ${String(err)}`);
   const delay = computeBackoffMs(consecutiveFailures);
   if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-    logError(`\u8FDE\u7EED\u5931\u8D25 ${MAX_CONSECUTIVE_FAILURES} \u6B21\uFF0C\u7B49\u5F85 ${delay / 1e3}s`);
+    logError2(`\u8FDE\u7EED\u5931\u8D25 ${MAX_CONSECUTIVE_FAILURES} \u6B21\uFF0C\u7B49\u5F85 ${delay / 1e3}s`);
   }
   await new Promise((r) => setTimeout(r, delay));
   return consecutiveFailures;
 }
-async function startPolling(account, sessions) {
+async function startPolling(account, sessions, manager) {
   const { baseUrl, token } = account;
   let getUpdatesBuf = "";
   let consecutiveFailures = 0;
@@ -1882,42 +2203,42 @@ async function startPolling(account, sessions) {
   let emptyPollCount = 0;
   const syncBufFile = getSyncBufFile();
   try {
-    if (fs2.existsSync(syncBufFile)) {
-      getUpdatesBuf = fs2.readFileSync(syncBufFile, "utf-8");
-      log(`\u6062\u590D\u4E0A\u6B21\u540C\u6B65\u72B6\u6001 (${getUpdatesBuf.length} bytes)`);
+    if (fs3.existsSync(syncBufFile)) {
+      getUpdatesBuf = fs3.readFileSync(syncBufFile, "utf-8");
+      log2(`\u6062\u590D\u4E0A\u6B21\u540C\u6B65\u72B6\u6001 (${getUpdatesBuf.length} bytes)`);
     }
   } catch (err) {
-    log(`\u52A0\u8F7D\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
+    log2(`\u52A0\u8F7D\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
   }
   loadContextTokens();
   if (account.savedAt) {
     try {
       const ageMs = Date.now() - new Date(account.savedAt).getTime();
       const ageHours = Math.round(ageMs / 36e5);
-      log(`\u51ED\u636E\u4FDD\u5B58\u4E8E ${account.savedAt}\uFF0C\u8DDD\u4ECA ${ageHours} \u5C0F\u65F6`);
+      log2(`\u51ED\u636E\u4FDD\u5B58\u4E8E ${account.savedAt}\uFF0C\u8DDD\u4ECA ${ageHours} \u5C0F\u65F6`);
     } catch {
     }
   }
-  log(`channel_version: ${CHANNEL_VERSION}`);
-  log("\u5F00\u59CB\u76D1\u542C\u5FAE\u4FE1\u6D88\u606F (\u72EC\u7ACB Bot \u6A21\u5F0F)...");
+  log2(`channel_version: ${CHANNEL_VERSION}`);
+  log2("\u5F00\u59CB\u76D1\u542C\u5FAE\u4FE1\u6D88\u606F (\u72EC\u7ACB Bot \u6A21\u5F0F)...");
   while (true) {
     try {
       const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
       const msgCount = resp.msgs?.length ?? 0;
-      log(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
+      log2(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
       const isError = resp.ret !== void 0 && resp.ret !== 0 || resp.errcode !== void 0 && resp.errcode !== 0;
       if (isError) {
         if (resp.ret === -14 || resp.errcode === -14) {
-          logError("\u4F1A\u8BDD\u5DF2\u8FC7\u671F (errcode -14)\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C setup \u767B\u5F55");
-          logError("1 \u5C0F\u65F6\u540E\u91CD\u8BD5...");
+          logError2("\u4F1A\u8BDD\u5DF2\u8FC7\u671F (errcode -14)\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C setup \u767B\u5F55");
+          logError2("1 \u5C0F\u65F6\u540E\u91CD\u8BD5...");
           await new Promise((r) => setTimeout(r, 36e5));
           continue;
         }
         consecutiveFailures++;
-        logError(`getUpdates \u5931\u8D25: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`);
+        logError2(`getUpdates \u5931\u8D25: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`);
         const delay = computeBackoffMs(consecutiveFailures);
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          logError(`\u8FDE\u7EED\u5931\u8D25 ${MAX_CONSECUTIVE_FAILURES} \u6B21\uFF0C\u7B49\u5F85 ${delay / 1e3}s`);
+          logError2(`\u8FDE\u7EED\u5931\u8D25 ${MAX_CONSECUTIVE_FAILURES} \u6B21\uFF0C\u7B49\u5F85 ${delay / 1e3}s`);
           consecutiveFailures = 0;
         }
         await new Promise((r) => setTimeout(r, delay));
@@ -1927,11 +2248,11 @@ async function startPolling(account, sessions) {
       if (resp.longpolling_timeout_ms && resp.longpolling_timeout_ms >= LONG_POLL_TIMEOUT_MIN_MS && resp.longpolling_timeout_ms <= LONG_POLL_TIMEOUT_MAX_MS) {
         longPollTimeout = resp.longpolling_timeout_ms;
       }
-      await processMessages(resp.msgs, account, sessions);
+      await processMessages(resp.msgs, account, sessions, manager);
       if (msgCount === 0) {
         emptyPollCount++;
         if (emptyPollCount % 10 === 0) {
-          log(`\u5FC3\u8DF3: \u957F\u8F6E\u8BE2\u6B63\u5E38 (\u5DF2\u7A7A\u8F6E\u8BE2 ${emptyPollCount} \u6B21)`);
+          log2(`\u5FC3\u8DF3: \u957F\u8F6E\u8BE2\u6B63\u5E38 (\u5DF2\u7A7A\u8F6E\u8BE2 ${emptyPollCount} \u6B21)`);
         }
       } else {
         emptyPollCount = 0;
@@ -1940,13 +2261,13 @@ async function startPolling(account, sessions) {
         const oldLen = getUpdatesBuf.length;
         getUpdatesBuf = resp.get_updates_buf;
         if (oldLen !== getUpdatesBuf.length) {
-          log(`sync_buf \u66F4\u65B0: ${oldLen}b \u2192 ${getUpdatesBuf.length}b`);
+          log2(`sync_buf \u66F4\u65B0: ${oldLen}b \u2192 ${getUpdatesBuf.length}b`);
         }
         try {
-          fs2.mkdirSync(getCredentialsDir(), { recursive: true });
-          fs2.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
+          fs3.mkdirSync(getCredentialsDir(), { recursive: true });
+          fs3.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
         } catch (err) {
-          log(`\u4FDD\u5B58\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
+          log2(`\u4FDD\u5B58\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
         }
       }
     } catch (err) {
@@ -1959,9 +2280,31 @@ async function main() {
     process2.exit(1);
   }
   let sessions = loadSessions();
-  log(`\u52A0\u8F7D\u4F1A\u8BDD: ${Object.keys(sessions).length} \u4E2A\u7528\u6237`);
+  log2(`\u52A0\u8F7D\u4F1A\u8BDD: ${Object.keys(sessions).length} \u4E2A\u7528\u6237`);
+  let account = null;
+  const managerDeps = {
+    sendMessage: async (to, text, contextToken) => {
+      if (!account) return;
+      await sendTextMessageWithRetry(
+        account.baseUrl,
+        account.token,
+        to,
+        text,
+        contextToken
+      );
+    },
+    getContextToken: getCachedContextToken
+  };
+  sessionManager = new SessionManager(managerDeps);
+  const sdkMode = await sessionManager.probeSdk();
+  if (sdkMode) {
+    log2("\u4F7F\u7528 Claude Agent SDK V2 \u6A21\u5F0F");
+  } else {
+    log2("\u4F7F\u7528 spawn \u6A21\u5F0F (claude -p \u5B50\u8FDB\u7A0B)");
+  }
   const cleanup = () => {
     typingManager.stopAll();
+    sessionManager?.closeAll();
     releaseLock();
     saveContextTokens();
   };
@@ -1974,12 +2317,12 @@ async function main() {
     cleanup();
     process2.exit(0);
   });
-  let account = loadCredentials();
+  account = loadCredentials();
   if (!account) {
-    log("\u672A\u627E\u5230\u5DF2\u4FDD\u5B58\u7684\u51ED\u636E\uFF0C\u542F\u52A8\u5FAE\u4FE1\u626B\u7801\u767B\u5F55...");
-    log("\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...");
+    log2("\u672A\u627E\u5230\u5DF2\u4FDD\u5B58\u7684\u51ED\u636E\uFF0C\u542F\u52A8\u5FAE\u4FE1\u626B\u7801\u767B\u5F55...");
+    log2("\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...");
     const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
-    log("\n\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u4EE5\u4E0B\u4E8C\u7EF4\u7801\uFF1A\n");
+    log2("\n\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u4EE5\u4E0B\u4E8C\u7EF4\u7801\uFF1A\n");
     try {
       const qrterm = await Promise.resolve().then(() => __toESM(require_main(), 1));
       await new Promise((resolve) => {
@@ -1993,9 +2336,9 @@ async function main() {
         );
       });
     } catch {
-      log(`\u4E8C\u7EF4\u7801\u94FE\u63A5: ${qrResp.qrcode_img_content}`);
+      log2(`\u4E8C\u7EF4\u7801\u94FE\u63A5: ${qrResp.qrcode_img_content}`);
     }
-    log("\u7B49\u5F85\u626B\u7801...");
+    log2("\u7B49\u5F85\u626B\u7801...");
     const deadline = Date.now() + 48e4;
     let scannedPrinted = false;
     while (Date.now() < deadline) {
@@ -2005,17 +2348,17 @@ async function main() {
           break;
         case "scaned":
           if (!scannedPrinted) {
-            log("\u5DF2\u626B\u7801\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4...");
+            log2("\u5DF2\u626B\u7801\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4...");
             scannedPrinted = true;
           }
           break;
         case "expired":
-          log("\u4E8C\u7EF4\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u542F\u52A8\u3002");
+          log2("\u4E8C\u7EF4\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u542F\u52A8\u3002");
           process2.exit(1);
           break;
         case "confirmed": {
           if (!status.ilink_bot_id || !status.bot_token) {
-            logError("\u767B\u5F55\u786E\u8BA4\u4F46\u672A\u8FD4\u56DE bot \u4FE1\u606F");
+            logError2("\u767B\u5F55\u786E\u8BA4\u4F46\u672A\u8FD4\u56DE bot \u4FE1\u606F");
             process2.exit(1);
           }
           const confirmedAccount = {
@@ -2027,7 +2370,7 @@ async function main() {
           };
           saveCredentials(confirmedAccount);
           account = confirmedAccount;
-          log("\u5FAE\u4FE1\u8FDE\u63A5\u6210\u529F\uFF01");
+          log2("\u5FAE\u4FE1\u8FDE\u63A5\u6210\u529F\uFF01");
           break;
         }
       }
@@ -2035,16 +2378,16 @@ async function main() {
       await new Promise((r) => setTimeout(r, 1e3));
     }
     if (!account) {
-      logError("\u767B\u5F55\u5931\u8D25\uFF0C\u9000\u51FA\u3002");
+      logError2("\u767B\u5F55\u5931\u8D25\uFF0C\u9000\u51FA\u3002");
       process2.exit(1);
     }
   } else {
-    log(`\u4F7F\u7528\u5DF2\u4FDD\u5B58\u8D26\u53F7: ${account.accountId}`);
+    log2(`\u4F7F\u7528\u5DF2\u4FDD\u5B58\u8D26\u53F7: ${account.accountId}`);
   }
   typingManager.configure(account.accountId, account.token, account.baseUrl);
-  await startPolling(account, sessions);
+  await startPolling(account, sessions, sessionManager);
 }
 main().catch((err) => {
-  logError(`Fatal: ${String(err)}`);
+  logError2(`Fatal: ${String(err)}`);
   process2.exit(1);
 });

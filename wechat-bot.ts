@@ -39,6 +39,7 @@ import {
 } from "./shared.js";
 import { TypingManager } from "./typing.js";
 import { downloadAndDecryptBuffer } from "./media.js";
+import { SessionManager } from "./session-manager.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -465,10 +466,10 @@ async function sendTextMessageWithRetry(
 // ── Claude Code subprocess ──────────────────────────────────────────────────
 
 /**
- * Call `claude -p` to get a reply for a WeChat message.
+ * Call `claude -p` to get a reply for a WeChat message (spawn fallback).
  * Returns the reply text, or an error message string on failure.
  */
-async function claudeReply(
+async function claudeReplySpawn(
   senderId: string,
   content: string,
   sessions: Record<string, string>,
@@ -560,6 +561,25 @@ async function claudeReply(
   });
 }
 
+// ── SessionManager (SDK mode) ──────────────────────────────────────────────
+
+let sessionManager: SessionManager | null = null;
+
+/**
+ * Unified reply function: uses SDK mode if available, falls back to spawn.
+ */
+async function claudeReply(
+  senderId: string,
+  content: string,
+  sessions: Record<string, string>,
+  account: AccountData,
+): Promise<string> {
+  if (sessionManager?.isSdkMode) {
+    return sessionManager.sendMessage(senderId, content);
+  }
+  return claudeReplySpawn(senderId, content, sessions, account);
+}
+
 // ── Built-in Commands ───────────────────────────────────────────────────────
 
 const HELP_TEXT = [
@@ -584,6 +604,7 @@ async function processMessages(
   msgs: WeixinMessage[] | undefined,
   account: AccountData,
   sessions: Record<string, string>,
+  manager: SessionManager | null,
 ): Promise<void> {
   for (const msg of msgs ?? []) {
     const senderId = msg.from_user_id ?? "unknown";
@@ -609,7 +630,11 @@ async function processMessages(
     // Handle built-in commands
     const trimmed = content.trim();
     if (trimmed === "/clear") {
-      clearSession(sessions, senderId);
+      if (manager?.isSdkMode) {
+        await manager.clearSession(senderId);
+      } else {
+        clearSession(sessions, senderId);
+      }
       const contextToken = getCachedContextToken(senderId);
       if (contextToken) {
         try {
@@ -686,6 +711,7 @@ async function handlePollError(
 async function startPolling(
   account: AccountData,
   sessions: Record<string, string>,
+  manager: SessionManager | null,
 ): Promise<never> {
   const { baseUrl, token } = account;
   let getUpdatesBuf = "";
@@ -757,7 +783,7 @@ async function startPolling(
       }
 
       // Process messages
-      await processMessages(resp.msgs, account, sessions);
+      await processMessages(resp.msgs, account, sessions, manager);
 
       // Heartbeat log
       if (msgCount === 0) {
@@ -800,9 +826,37 @@ async function main() {
   let sessions = loadSessions();
   log(`加载会话: ${Object.keys(sessions).length} 个用户`);
 
+  // Account placeholder — assigned after login/credential check
+  let account: AccountData | null = null;
+
+  // Initialize SessionManager (SDK mode)
+  const managerDeps = {
+    sendMessage: async (to: string, text: string, contextToken: string) => {
+      if (!account) return;
+      await sendTextMessageWithRetry(
+        account.baseUrl,
+        account.token,
+        to,
+        text,
+        contextToken,
+      );
+    },
+    getContextToken: getCachedContextToken,
+  };
+
+  sessionManager = new SessionManager(managerDeps);
+  const sdkMode = await sessionManager.probeSdk();
+
+  if (sdkMode) {
+    log("使用 Claude Agent SDK V2 模式");
+  } else {
+    log("使用 spawn 模式 (claude -p 子进程)");
+  }
+
   // Cleanup on exit
   const cleanup = () => {
     typingManager.stopAll();
+    sessionManager?.closeAll();
     releaseLock();
     saveContextTokens();
   };
@@ -817,7 +871,7 @@ async function main() {
   });
 
   // Check for saved credentials
-  let account = loadCredentials();
+  account = loadCredentials();
 
   if (!account) {
     log("未找到已保存的凭据，启动微信扫码登录...");
@@ -895,7 +949,7 @@ async function main() {
   typingManager.configure(account.accountId, account.token, account.baseUrl);
 
   // Start long-poll (runs forever)
-  await startPolling(account, sessions);
+  await startPolling(account, sessions, sessionManager);
 }
 
 main().catch((err) => {
