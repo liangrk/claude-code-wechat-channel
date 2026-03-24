@@ -1,33 +1,22 @@
 #!/usr/bin/env bun
 /**
- * Claude Code WeChat Channel Plugin
+ * WeChat Bot — Standalone mode (no MCP channel dependency).
  *
- * Bridges WeChat messages into a Claude Code session via the Channels MCP protocol.
- * Uses the official WeChat ClawBot ilink API (same as @tencent-weixin/openclaw-weixin).
+ * Bridges WeChat messages to Claude Code via `claude -p` subprocess.
+ * Works with any API key (including third-party like GLM), without OAuth.
  *
  * Flow:
- *   1. QR login via ilink/bot/get_bot_qrcode + get_qrcode_status
- *   2. Long-poll ilink/bot/getupdates for incoming WeChat messages
- *   3. Forward messages to Claude Code as <channel> events
- *   4. Expose a reply tool so Claude can send messages back via ilink/bot/sendmessage
+ *   WeChat → ClawBot → ilink API → bot process → claude -p → stdout → bot process → ilink API → WeChat
  */
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
-import { execSync } from "node:child_process";
-
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { spawn, execSync } from "node:child_process";
 
 import {
   type AccountData,
-  type CDNMedia,
-  type MessageItem,
   type WeixinMessage,
   DEFAULT_BASE_URL,
   CHANNEL_VERSION,
@@ -49,11 +38,9 @@ import {
   pollQRStatus,
 } from "./shared.js";
 import { TypingManager } from "./typing.js";
-import { downloadAndDecryptBuffer, uploadMediaToCdn, readLocalFile } from "./media.js";
+import { downloadAndDecryptBuffer } from "./media.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-
-const CHANNEL_NAME = "wechat";
 
 const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_REPLY_LENGTH = 4096;
@@ -64,20 +51,25 @@ const CONTEXT_TOKEN_MAX_ENTRIES = 500;
 const CONTEXT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const LONG_POLL_TIMEOUT_MIN_MS = 10_000;
 const LONG_POLL_TIMEOUT_MAX_MS = 60_000;
+const CLAUDE_TIMEOUT_MS = 120_000; // 2 min for claude -p
 
-// ── Logging (stderr only — stdout is MCP stdio) ─────────────────────────────
+// ── Logging ──────────────────────────────────────────────────────────────────
 
 function log(msg: string) {
-  process.stderr.write(`[wechat-channel] ${msg}\n`);
+  process.stderr.write(`[wechat-bot] ${msg}\n`);
 }
 
 function logError(msg: string) {
-  process.stderr.write(`[wechat-channel] ERROR: ${msg}\n`);
+  process.stderr.write(`[wechat-bot] ERROR: ${msg}\n`);
 }
 
-// ── WeChat Message Types ─────────────────────────────────────────────────────
+// ── Message type constants ───────────────────────────────────────────────────
 
-export interface GetUpdatesResp {
+const MSG_TYPE_USER = 1;
+const MSG_TYPE_BOT = 2;
+const MSG_STATE_FINISH = 2;
+
+interface GetUpdatesResp {
   ret?: number;
   errcode?: number;
   errmsg?: string;
@@ -85,11 +77,6 @@ export interface GetUpdatesResp {
   get_updates_buf?: string;
   longpolling_timeout_ms?: number;
 }
-
-// Message type constants
-const MSG_TYPE_USER = 1;
-const MSG_TYPE_BOT = 2;
-const MSG_STATE_FINISH = 2;
 
 // ── Context Token Cache (LRU with TTL) ──────────────────────────────────────
 
@@ -130,7 +117,7 @@ function saveContextTokens(): void {
     try {
       fs.chmodSync(file, 0o600);
     } catch {
-      // best-effort on platforms that don't support chmod
+      // best-effort
     }
   } catch {
     // best-effort
@@ -139,13 +126,11 @@ function saveContextTokens(): void {
 
 function evictContextTokens(): void {
   const now = Date.now();
-  // Evict expired entries
   for (const [key, entry] of contextTokenCache.entries()) {
     if (now - entry.lastAccessed > CONTEXT_TOKEN_TTL_MS) {
       contextTokenCache.delete(key);
     }
   }
-  // Evict oldest if still over max
   if (contextTokenCache.size > CONTEXT_TOKEN_MAX_ENTRIES) {
     const entries = [...contextTokenCache.entries()].sort(
       (a, b) => a[1].lastAccessed - b[1].lastAccessed,
@@ -174,9 +159,42 @@ function getCachedContextToken(userId: string): string | undefined {
   return entry.token;
 }
 
+// ── Session Management ───────────────────────────────────────────────────────
+
+const SESSIONS_FILE = path.join(getCredentialsDir(), "sessions.json");
+
+function loadSessions(): Record<string, string> {
+  try {
+    if (!fs.existsSync(SESSIONS_FILE)) return {};
+    return JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8")) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function saveSessions(sessions: Record<string, string>): void {
+  try {
+    const dir = getCredentialsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions), "utf-8");
+    try {
+      fs.chmodSync(SESSIONS_FILE, 0o600);
+    } catch {
+      // best-effort
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+function clearSession(sessions: Record<string, string>, senderId: string): void {
+  delete sessions[senderId];
+  saveSessions(sessions);
+}
+
 // ── Instance Lock ────────────────────────────────────────────────────────────
 
-const LOCK_STALE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const LOCK_STALE_TIMEOUT_MS = 10 * 60 * 1000;
 
 function getLockFileAge(lockFile: string): number {
   try {
@@ -187,16 +205,15 @@ function getLockFileAge(lockFile: string): number {
   }
 }
 
-function isLikelyWechatChannel(pid: number): boolean {
+function isLikelyWechatBot(pid: number): boolean {
   try {
     const isWin = process.platform === "win32";
     const cmd = isWin
       ? `wmic process where "ProcessId=${pid}" get CommandLine /FORMAT:LIST 2>NUL`
       : `cat /proc/${pid}/cmdline 2>/dev/null || ps -p ${pid} -o command= 2>/dev/null`;
     const output = execSync(cmd, { encoding: "utf-8", timeout: 3000 });
-    return output.toLowerCase().includes("wechat-channel");
+    return output.toLowerCase().includes("wechat-bot") || output.toLowerCase().includes("wechat-channel");
   } catch {
-    // Cannot determine — assume it is to be safe
     return true;
   }
 }
@@ -205,8 +222,6 @@ function acquireLock(): boolean {
   const lockFile = getLockPidFile();
   try {
     fs.mkdirSync(getCredentialsDir(), { recursive: true });
-
-    // Use exclusive create to avoid TOCTOU race
     try {
       const fd = fs.openSync(lockFile, "wx");
       fs.writeSync(fd, String(process.pid));
@@ -214,27 +229,22 @@ function acquireLock(): boolean {
       return true;
     } catch (err: any) {
       if (err.code === "EEXIST") {
-        // Lock file exists — check if the process is still alive
         try {
           const existingPid = parseInt(fs.readFileSync(lockFile, "utf-8").trim(), 10);
           if (!isNaN(existingPid)) {
             process.kill(existingPid, 0);
-
-            // Process is alive — check if the lock is stale (older than 10 min)
             const age = getLockFileAge(lockFile);
             if (age > LOCK_STALE_TIMEOUT_MS) {
               log(`锁文件已过期 (${Math.round(age / 60_000)} 分钟前创建)，尝试清理...`);
-            } else if (isLikelyWechatChannel(existingPid)) {
-              // Process is alive, lock is fresh, and it looks like our process
+            } else if (isLikelyWechatBot(existingPid)) {
               logError(`另一个实例已在运行 (PID ${existingPid})，退出。`);
               return false;
             } else {
-              // Process is alive but doesn't look like wechat-channel (PID reused)
-              log(`PID ${existingPid} 存活但不是 wechat-channel 进程 (可能 PID 复用)，清理锁文件...`);
+              log(`PID ${existingPid} 存活但不是 wechat 进程 (可能 PID 复用)，清理锁文件...`);
             }
           }
         } catch {
-          // Process not running — stale lock, try to remove and retry
+          // Process not running — stale lock
         }
         try {
           fs.unlinkSync(lockFile);
@@ -290,15 +300,10 @@ function truncateText(text: string, maxLen: number = MAX_REPLY_LENGTH): string {
 
 // ── Message Extraction ───────────────────────────────────────────────────────
 
-/**
- * Extract content from a WeChat message. Handles text, voice, image, file, and video.
- * Returns a string suitable for sending to Claude Code.
- */
 async function extractContentFromMessage(msg: WeixinMessage): Promise<string> {
   if (!msg.item_list?.length) return "";
 
   for (const item of msg.item_list) {
-    // Text message
     if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
       const text = item.text_item.text;
       const ref = item.ref_msg;
@@ -320,16 +325,14 @@ async function extractContentFromMessage(msg: WeixinMessage): Promise<string> {
       return `[引用: ${parts.join(" | ")}]\n${text}`;
     }
 
-    // Voice message (transcribed text)
     if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
       return `[语音] ${item.voice_item.text}`;
     }
 
-    // Image message — download, decrypt, and send as base64 data URI
     if (item.type === MSG_ITEM_IMAGE && item.image_item?.media) {
       const buf = await downloadAndDecryptBuffer(item.image_item.media);
       if (buf) {
-        const MAX_IMAGE_SIZE = 512 * 1024; // 512 KB
+        const MAX_IMAGE_SIZE = 512 * 1024;
         if (buf.length > MAX_IMAGE_SIZE) {
           return `[图片] (图片过大: ${(buf.length / 1024).toFixed(0)}KB，已跳过)`;
         }
@@ -340,7 +343,6 @@ async function extractContentFromMessage(msg: WeixinMessage): Promise<string> {
       return "[图片] (无法下载或解密)";
     }
 
-    // File message — show filename and size
     if (item.type === MSG_ITEM_FILE && item.file_item) {
       const fi = item.file_item;
       const parts: string[] = ["[文件]"];
@@ -349,7 +351,6 @@ async function extractContentFromMessage(msg: WeixinMessage): Promise<string> {
       return parts.join(" ");
     }
 
-    // Video message — show metadata
     if (item.type === MSG_ITEM_VIDEO && item.video_item) {
       const vi = item.video_item;
       const parts: string[] = ["[视频]"];
@@ -461,253 +462,113 @@ async function sendTextMessageWithRetry(
   throw lastError;
 }
 
-// ── MCP Channel Server ──────────────────────────────────────────────────────
+// ── Claude Code subprocess ──────────────────────────────────────────────────
 
-const mcp = new Server(
-  { name: CHANNEL_NAME, version: CHANNEL_VERSION },
-  {
-    capabilities: {
-      experimental: { "claude/channel": {} },
-      tools: {},
-    },
-    instructions: [
-      `Messages from WeChat users arrive as <channel source="wechat" sender="..." sender_id="...">`,
-      "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
-      "Messages are from real WeChat users via the WeChat ClawBot interface.",
-      "Users may send text, voice (auto-transcribed), images (base64 data URI), files, and videos.",
-      "Respond naturally in Chinese unless the user writes in another language.",
-      "Keep replies concise — WeChat is a chat app, not an essay platform.",
-      "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
-      "To send an image back, use the wechat_send_image tool with a local file path.",
-    ].join("\n"),
-  },
-);
+/**
+ * Call `claude -p` to get a reply for a WeChat message.
+ * Returns the reply text, or an error message string on failure.
+ */
+async function claudeReply(
+  senderId: string,
+  content: string,
+  sessions: Record<string, string>,
+  account: AccountData,
+): Promise<string> {
+  const sessionId = sessions[senderId];
+  const senderName = senderId.split("@")[0] || senderId;
 
-// Tool: reply to WeChat
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "wechat_reply",
-      description: "Send a text reply back to the WeChat user",
-      inputSchema: {
-        type: "object" as const,
-        properties: {
-          sender_id: {
-            type: "string",
-            description:
-              "The sender_id from the inbound <channel> tag (xxx@im.wechat format)",
-          },
-          text: {
-            type: "string",
-            description: "The plain-text message to send (no markdown)",
-          },
-        },
-        required: ["sender_id", "text"],
-      },
-    },
-    {
-      name: "wechat_send_image",
-      description: "Send an image back to the WeChat user by uploading a local file",
-      inputSchema: {
-        type: "object" as const,
-        properties: {
-          sender_id: {
-            type: "string",
-            description:
-              "The sender_id from the inbound <channel> tag (xxx@im.wechat format)",
-          },
-          file_path: {
-            type: "string",
-            description: "Absolute path to a local image file (PNG, JPEG, GIF, or WebP)",
-          },
-        },
-        required: ["sender_id", "file_path"],
-      },
-    },
-  ],
-}));
+  const prompt = `[微信消息] 来自: ${senderName}\n${content}\n\n请用中文回复，不要使用 Markdown 格式。`;
 
-let activeAccount: AccountData | null = null;
-const typingManager = new TypingManager();
+  const args = [
+    "-p",
+    prompt,
+    "--output-format",
+    "json",
+    "--dangerously-skip-permissions",
+    "--max-turns",
+    "1",
+  ];
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (req.params.name === "wechat_reply") {
-    const { sender_id, text } = req.params.arguments as {
-      sender_id: string;
-      text: string;
-    };
-
-    // P0 — Input validation
-    if (!validateSenderId(sender_id)) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "error: invalid sender_id format",
-          },
-        ],
-      };
-    }
-    if (!text || typeof text !== "string") {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "error: text is required and must be a string",
-          },
-        ],
-      };
-    }
-
-    if (!activeAccount) {
-      return {
-        content: [{ type: "text" as const, text: "error: not logged in" }],
-      };
-    }
-    const contextToken = getCachedContextToken(sender_id);
-    if (!contextToken) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`,
-          },
-        ],
-      };
-    }
-    try {
-      // Cancel typing indicator on reply
-      await typingManager.sendTyping(sender_id, 2);
-      await sendTextMessageWithRetry(
-        activeAccount.baseUrl,
-        activeAccount.token,
-        sender_id,
-        text,
-        contextToken,
-      );
-      return { content: [{ type: "text" as const, text: "sent" }] };
-    } catch (err) {
-      logError(`发送回复失败: ${String(err)}`);
-      return {
-        content: [
-          { type: "text" as const, text: `send failed: ${String(err)}` },
-        ],
-      };
-    }
+  if (sessionId) {
+    args.unshift("--resume", sessionId);
   }
 
-  if (req.params.name === "wechat_send_image") {
-    const { sender_id, file_path } = req.params.arguments as {
-      sender_id: string;
-      file_path: string;
-    };
+  log(`调用 claude ${sessionId ? `--resume ${sessionId.slice(0, 8)}...` : "(新会话)"} — ${content.slice(0, 50)}...`);
 
-    if (!validateSenderId(sender_id)) {
-      return {
-        content: [
-          { type: "text" as const, text: "error: invalid sender_id format" },
-        ],
-      };
-    }
-    if (!file_path || typeof file_path !== "string") {
-      return {
-        content: [
-          { type: "text" as const, text: "error: file_path is required and must be a string" },
-        ],
-      };
-    }
+  return new Promise<string>((resolve) => {
+    const child = spawn("claude", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "",
+      },
+    });
 
-    if (!activeAccount) {
-      return {
-        content: [{ type: "text" as const, text: "error: not logged in" }],
-      };
-    }
-    const contextToken = getCachedContextToken(sender_id);
-    if (!contextToken) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`,
-          },
-        ],
-      };
-    }
+    let stdout = "";
+    let stderr = "";
 
-    try {
-      // Cancel typing on send
-      await typingManager.sendTyping(sender_id, 2);
+    child.stdout.on("data", (data: Buffer) => {
+      stdout += data.toString();
+    });
 
-      const buf = readLocalFile(file_path);
-      if (!buf) {
-        const displayName = file_path.split(/[\\/]/).pop() ?? file_path;
-        return {
-          content: [
-            { type: "text" as const, text: `error: cannot read file: ${displayName}` },
-          ],
-        };
+    child.stderr.on("data", (data: Buffer) => {
+      stderr += data.toString();
+    });
+
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      logError(`claude -p 超时 (${CLAUDE_TIMEOUT_MS / 1000}s)`);
+      resolve("抱歉，回复超时了，请稍后再试。");
+    }, CLAUDE_TIMEOUT_MS);
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+
+      if (code !== 0 || !stdout.trim()) {
+        const errSnippet = stderr.slice(0, 200) || `exit code ${code}`;
+        logError(`claude -p 失败: ${errSnippet}`);
+        resolve("抱歉，处理消息时出现了问题，请稍后再试。");
+        return;
       }
 
-      const ext = detectImageExtension(buf);
-      const fileName = file_path.split(/[\\/]/).pop() || `image.${ext}`;
+      try {
+        const result = JSON.parse(stdout.trim());
+        const reply = result.result ?? result.text ?? result.output ?? JSON.stringify(result);
 
-      const uploadResult = await uploadMediaToCdn(
-        activeAccount.baseUrl,
-        activeAccount.token,
-        { file_type: 2, file_size: buf.length, file_name: fileName },
-        buf,
-      );
+        // Extract session_id if this was a new session
+        if (!sessionId && result.session_id) {
+          sessions[senderId] = result.session_id;
+          saveSessions(sessions);
+          log(`保存新会话: ${senderId} → ${result.session_id.slice(0, 8)}...`);
+        }
 
-      if (!uploadResult?.file_token) {
-        return {
-          content: [
-            { type: "text" as const, text: "error: upload failed — no file_token returned" },
-          ],
-        };
+        log(`claude 回复: ${reply.slice(0, 80)}...`);
+        resolve(reply);
+      } catch {
+        // If not valid JSON, use raw stdout
+        const rawReply = stdout.trim().slice(0, MAX_REPLY_LENGTH);
+        log(`claude 回复 (raw): ${rawReply.slice(0, 80)}...`);
+        resolve(rawReply);
       }
+    });
 
-      const clientId = generateClientId();
-      await apiFetch({
-        baseUrl: activeAccount.baseUrl,
-        endpoint: "ilink/bot/sendmessage",
-        body: JSON.stringify({
-          msg: {
-            from_user_id: "",
-            to_user_id: sender_id,
-            client_id: clientId,
-            message_type: MSG_TYPE_BOT,
-            message_state: MSG_STATE_FINISH,
-            item_list: [
-              {
-                type: MSG_ITEM_IMAGE,
-                image_item: {
-                  file_token: uploadResult.file_token,
-                  aeskey: uploadResult.aes_key,
-                  encrypt_type: uploadResult.encrypt_type ?? 1,
-                },
-              },
-            ],
-            context_token: contextToken,
-          },
-          base_info: buildBaseInfo(),
-        }),
-        token: activeAccount.token,
-        timeoutMs: 30_000,
-      });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      logError(`claude -p 启动失败: ${err.message}`);
+      resolve("抱歉，Claude Code 未安装或无法启动。请确保 claude 命令可用。");
+    });
+  });
+}
 
-      return { content: [{ type: "text" as const, text: "image sent" }] };
-    } catch (err) {
-      logError(`发送图片失败: ${String(err)}`);
-      return {
-        content: [
-          { type: "text" as const, text: `send image failed: ${String(err)}` },
-        ],
-      };
-    }
-  }
+// ── Built-in Commands ───────────────────────────────────────────────────────
 
-  throw new Error(`unknown tool: ${req.params.name}`);
-});
+const HELP_TEXT = [
+  "可用命令：",
+  "/help — 显示此帮助",
+  "/clear — 清空对话上下文，开始新会话",
+  "",
+  "其他消息会直接发送给 Claude Code 处理。",
+].join("\n");
 
 // ── Long-poll loop ──────────────────────────────────────────────────────────
 
@@ -717,13 +578,18 @@ function computeBackoffMs(failures: number): number {
   return Math.min(base + jitter, 60_000);
 }
 
-async function processMessages(msgs: WeixinMessage[] | undefined): Promise<void> {
+const typingManager = new TypingManager();
+
+async function processMessages(
+  msgs: WeixinMessage[] | undefined,
+  account: AccountData,
+  sessions: Record<string, string>,
+): Promise<void> {
   for (const msg of msgs ?? []) {
     const senderId = msg.from_user_id ?? "unknown";
     const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
     log(`入站消息: from=${senderId} msg_type=${msg.message_type} items=[${types}]`);
 
-    // Only process user messages (not bot messages)
     if (msg.message_type !== MSG_TYPE_USER) continue;
 
     // Cache context token for reply
@@ -731,35 +597,74 @@ async function processMessages(msgs: WeixinMessage[] | undefined): Promise<void>
       cacheContextToken(senderId, msg.context_token);
     }
 
-    // Send typing indicator (start)
-    await typingManager.sendTyping(senderId, 1);
-    typingManager.startKeepalive(senderId);
-
     const content = await extractContentFromMessage(msg);
     if (!content) {
-      const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
-      log(`过滤消息: from=${senderId} item_types=[${types}] (无可用内容)`);
-      await typingManager.sendTyping(senderId, 2);
-      typingManager.stopKeepalive(senderId);
+      const itemTypes = msg.item_list?.map((i) => i.type).join(",") ?? "none";
+      log(`过滤消息: from=${senderId} item_types=[${itemTypes}] (无可用内容)`);
       continue;
     }
 
     log(`收到消息: from=${senderId} content=${content.slice(0, 80)}...`);
 
-    // Push to Claude Code session
+    // Handle built-in commands
+    const trimmed = content.trim();
+    if (trimmed === "/clear") {
+      clearSession(sessions, senderId);
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, "上下文已清空，下次消息将开始新会话。", contextToken);
+        } catch (err) {
+          logError(`发送 /clear 回复失败: ${String(err)}`);
+        }
+      }
+      continue;
+    }
+
+    if (trimmed === "/help") {
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, HELP_TEXT, contextToken);
+        } catch (err) {
+          logError(`发送 /help 回复失败: ${String(err)}`);
+        }
+      }
+      continue;
+    }
+
+    // Send typing indicator
+    await typingManager.sendTyping(senderId, 1);
+    typingManager.startKeepalive(senderId);
+
     try {
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content,
-          meta: {
-            sender: senderId.split("@")[0] || senderId,
-            sender_id: senderId,
-          },
-        },
-      });
+      const reply = await claudeReply(senderId, content, sessions, account);
+
+      // Cancel typing
+      await typingManager.sendTyping(senderId, 2);
+      typingManager.stopKeepalive(senderId);
+
+      // Send reply back to WeChat
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, reply, contextToken);
+      } else {
+        logError(`无法回复 ${senderId}: 缺少 context_token`);
+      }
     } catch (err) {
-      logError(`推送消息到 Claude Code 失败: ${String(err)}`);
+      logError(`处理消息失败: ${String(err)}`);
+      await typingManager.sendTyping(senderId, 2);
+      typingManager.stopKeepalive(senderId);
+
+      // Send error message back to user
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, "抱歉，处理消息时出现了问题，请稍后再试。", contextToken);
+        } catch {
+          // ignore
+        }
+      }
     }
   }
 }
@@ -772,22 +677,23 @@ async function handlePollError(
   logError(`轮询异常: ${String(err)}`);
   const delay = computeBackoffMs(consecutiveFailures);
   if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-    logError(
-      `连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${delay / 1000}s`,
-    );
+    logError(`连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${delay / 1000}s`);
   }
   await new Promise((r) => setTimeout(r, delay));
   return consecutiveFailures;
 }
 
-async function startPolling(account: AccountData): Promise<never> {
+async function startPolling(
+  account: AccountData,
+  sessions: Record<string, string>,
+): Promise<never> {
   const { baseUrl, token } = account;
   let getUpdatesBuf = "";
   let consecutiveFailures = 0;
   let longPollTimeout = LONG_POLL_TIMEOUT_MS;
   let emptyPollCount = 0;
 
-  // Load cached sync buf if available
+  // Load cached sync buf
   const syncBufFile = getSyncBufFile();
   try {
     if (fs.existsSync(syncBufFile)) {
@@ -813,22 +719,19 @@ async function startPolling(account: AccountData): Promise<never> {
   }
 
   log(`channel_version: ${CHANNEL_VERSION}`);
-  log("开始监听微信消息...");
+  log("开始监听微信消息 (独立 Bot 模式)...");
 
   while (true) {
     try {
       const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
 
-      // Diagnostic logging
       const msgCount = resp.msgs?.length ?? 0;
       log(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
 
-      // Handle API errors
       const isError =
         (resp.ret !== undefined && resp.ret !== 0) ||
         (resp.errcode !== undefined && resp.errcode !== 0);
       if (isError) {
-        // Session expired (errcode -14)
         if (resp.ret === -14 || resp.errcode === -14) {
           logError("会话已过期 (errcode -14)，请重新运行 setup 登录");
           logError("1 小时后重试...");
@@ -837,9 +740,7 @@ async function startPolling(account: AccountData): Promise<never> {
         }
 
         consecutiveFailures++;
-        logError(
-          `getUpdates 失败: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`,
-        );
+        logError(`getUpdates 失败: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`);
         const delay = computeBackoffMs(consecutiveFailures);
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
           logError(`连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${delay / 1000}s`);
@@ -851,15 +752,14 @@ async function startPolling(account: AccountData): Promise<never> {
 
       consecutiveFailures = 0;
 
-      // Adapt long-poll timeout from server
       if (resp.longpolling_timeout_ms && resp.longpolling_timeout_ms >= LONG_POLL_TIMEOUT_MIN_MS && resp.longpolling_timeout_ms <= LONG_POLL_TIMEOUT_MAX_MS) {
         longPollTimeout = resp.longpolling_timeout_ms;
       }
 
-      // Process messages FIRST, then save sync buf
-      await processMessages(resp.msgs);
+      // Process messages
+      await processMessages(resp.msgs, account, sessions);
 
-      // Heartbeat log every 10 empty polls (~5-6 min)
+      // Heartbeat log
       if (msgCount === 0) {
         emptyPollCount++;
         if (emptyPollCount % 10 === 0) {
@@ -869,7 +769,7 @@ async function startPolling(account: AccountData): Promise<never> {
         emptyPollCount = 0;
       }
 
-      // Save sync buf AFTER successful message processing
+      // Save sync buf
       if (resp.get_updates_buf) {
         const oldLen = getUpdatesBuf.length;
         getUpdatesBuf = resp.get_updates_buf;
@@ -897,6 +797,9 @@ async function main() {
     process.exit(1);
   }
 
+  let sessions = loadSessions();
+  log(`加载会话: ${Object.keys(sessions).length} 个用户`);
+
   // Cleanup on exit
   const cleanup = () => {
     typingManager.stopAll();
@@ -913,17 +816,12 @@ async function main() {
     process.exit(0);
   });
 
-  // Connect MCP transport first (Claude Code expects stdio handshake)
-  await mcp.connect(new StdioServerTransport());
-  log("MCP 连接就绪");
-
   // Check for saved credentials
   let account = loadCredentials();
 
   if (!account) {
     log("未找到已保存的凭据，启动微信扫码登录...");
 
-    // Inline QR login flow (same as setup.ts but using shared helpers)
     log("正在获取微信登录二维码...");
     const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
 
@@ -956,7 +854,7 @@ async function main() {
           break;
         case "scaned":
           if (!scannedPrinted) {
-            log("👀 已扫码，请在微信中确认...");
+            log("已扫码，请在微信中确认...");
             scannedPrinted = true;
           }
           break;
@@ -978,7 +876,7 @@ async function main() {
           };
           saveCredentials(confirmedAccount);
           account = confirmedAccount;
-          log("✅ 微信连接成功！");
+          log("微信连接成功！");
           break;
         }
       }
@@ -994,11 +892,10 @@ async function main() {
     log(`使用已保存账号: ${account.accountId}`);
   }
 
-  activeAccount = account;
   typingManager.configure(account.accountId, account.token, account.baseUrl);
 
   // Start long-poll (runs forever)
-  await startPolling(account);
+  await startPolling(account, sessions);
 }
 
 main().catch((err) => {

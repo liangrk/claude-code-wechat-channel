@@ -6,10 +6,18 @@
 
 ## 工作原理
 
+### MCP 模式（需要 OAuth）
+
 ```
 微信 (iOS/Android) → WeChat ClawBot → ilink API → [本插件] → Claude Code Session
                                                        ↕
 Claude Code ← MCP Channel Protocol ← wechat_reply / wechat_send_image tool
+```
+
+### 独立 Bot 模式（支持任意 API key）
+
+```
+微信 (iOS/Android) → WeChat ClawBot → ilink API → bot 进程 → claude -p → stdout → bot 进程 → ilink API → 微信
 ```
 
 ## 前置要求
@@ -21,7 +29,31 @@ Claude Code ← MCP Channel Protocol ← wechat_reply / wechat_send_image tool
 
 ## 快速开始
 
-### 1. 微信扫码登录
+### 方式一：独立 Bot 模式（推荐，无需 OAuth）
+
+适用于使用 API key（包括第三方如 GLM/智谱）的用户，不需要 Claude Code OAuth 登录。
+
+```bash
+# 1. 微信扫码登录
+npx @liangrk/claude-code-wechatbot setup
+
+# 2. 启动独立 Bot
+npx @liangrk/claude-code-wechatbot bot
+```
+
+打开微信，找到 ClawBot 对话，发送消息即可与 Claude Code 对话。
+
+内置命令：
+- `/help` — 显示帮助
+- `/clear` — 清空对话上下文，开始新会话
+
+> **注意**: 需要系统 PATH 中有 `claude` 命令，且已配置 `ANTHROPIC_API_KEY`（或第三方兼容 API key）。
+
+### 方式二：MCP 模式（需要 Claude Code OAuth）
+
+适用于已登录 claude.ai 账号的用户。
+
+#### 1. 微信扫码登录
 
 ```bash
 npx @liangrk/claude-code-wechatbot setup
@@ -29,7 +61,7 @@ npx @liangrk/claude-code-wechatbot setup
 
 终端会显示二维码，用微信扫描并确认。凭据保存到 `~/.claude/channels/wechat/account.json`。
 
-### 2. 生成 MCP 配置
+#### 2. 生成 MCP 配置
 
 ```bash
 npx @liangrk/claude-code-wechatbot install
@@ -37,15 +69,15 @@ npx @liangrk/claude-code-wechatbot install
 
 这会在当前目录生成（或更新） `.mcp.json`，指向本插件。
 
-### 3. 启动 Claude Code + WeChat 通道
+#### 3. 启动 Claude Code + WeChat 通道
 
 在包含 `.mcp.json` 的目录下启动 Claude Code，MCP server 会自动加载：
 
 ```bash
-claude --dangerously-skip-permissions
+claude --dangerously-load-development-channels server:wechat
 ```
 
-### 4. 在微信中发消息
+#### 4. 在微信中发消息
 
 打开微信，找到 ClawBot 对话，发送消息。消息会出现在 Claude Code 终端中，Claude 的回复会自动发回微信。
 
@@ -90,7 +122,7 @@ node cli.mjs status
 然后在包含 `.mcp.json` 的目录下启动 Claude Code：
 
 ```bash
-claude --dangerously-skip-permissions
+claude --dangerously-load-development-channels server:wechat
 ```
 
 > **注意**: 如果安装了 Bun，也可以用 `bun cli.mjs start` 替代 `node cli.mjs start`，性能更好。
@@ -100,10 +132,19 @@ claude --dangerously-skip-permissions
 | 命令 | 说明 |
 |------|------|
 | `npx @liangrk/claude-code-wechatbot setup` | 微信扫码登录 |
-| `npx @liangrk/claude-code-wechatbot start` | 启动 MCP Channel 服务器 |
+| `npx @liangrk/claude-code-wechatbot start` | 启动 MCP Channel 服务器（需要 OAuth） |
+| `npx @liangrk/claude-code-wechatbot bot` | 启动独立 Bot 模式（支持任意 API key） |
 | `npx @liangrk/claude-code-wechatbot status` | 检查账号和 API 连接状态 |
 | `npx @liangrk/claude-code-wechatbot install` | 生成 .mcp.json 配置 |
 | `npx @liangrk/claude-code-wechatbot help` | 显示帮助 |
+
+### 停止服务
+
+插件没有内置 stop 命令，通过终止进程来停止：
+
+```bash
+wmic process where "commandline like '%%wechat-channel%%'" delete
+```
 
 ## 安装
 

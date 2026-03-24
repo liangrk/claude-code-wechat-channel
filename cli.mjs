@@ -103,22 +103,12 @@ async function status() {
   console.log("");
   console.log("Testing API connectivity...");
 
-  // Read channel version from package.json (same logic as shared.ts)
-  let channelVersion = "unknown";
-  try {
-    const pkgPath = resolve(__dirname, "package.json");
-    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-    channelVersion = pkg.version || "unknown";
-  } catch {
-    // fallback
-  }
-
   const uint32 = randomBytes(4).readUInt32BE(0);
   const wechatUin = Buffer.from(String(uint32), "utf-8").toString("base64");
 
   const body = JSON.stringify({
     get_updates_buf: "",
-    base_info: { channel_version: channelVersion },
+    base_info: { channel_version: "1.0.3" },
   });
 
   const base = (account.baseUrl || "https://ilinkai.weixin.qq.com").replace(/\/$/, "") + "/";
@@ -249,7 +239,7 @@ function install() {
   console.log(`
 Next steps:
   1. Run: npx claude-code-wechat-channel setup
-  2. Then: claude --dangerously-skip-permissions
+  2. Then: claude --dangerously-load-development-channels server:wechat
 `);
 }
 
@@ -261,7 +251,8 @@ function help() {
 
   Commands:
     setup     WeChat QR login (scan to authenticate)
-    start     Start the channel MCP server
+    start     Start the channel MCP server (requires OAuth)
+    bot       Start standalone bot mode (works with any API key)
     status    Check account and API connectivity
     install   Write .mcp.json to current directory
     help      Show this help message
@@ -276,6 +267,9 @@ switch (command) {
     break;
   case "start":
     runScript("wechat-channel.js");
+    break;
+  case "bot":
+    runScript("wechat-bot.js");
     break;
   case "status":
     status();

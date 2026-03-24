@@ -13,7 +13,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "esbuild wechat-channel.ts --bundle --platform=node --format=esm --outfile=dist/wechat-channel.js && esbuild setup.ts --bundle --platform=node --format=esm --outfile=dist/setup.js",
+    "build": "esbuild wechat-channel.ts --bundle --platform=node --format=esm --outfile=dist/wechat-channel.js && esbuild setup.ts --bundle --platform=node --format=esm --outfile=dist/setup.js && esbuild wechat-bot.ts --bundle --platform=node --format=esm --outfile=dist/wechat-bot.js",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },

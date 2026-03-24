@@ -21888,7 +21888,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 var DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 var BOT_TYPE = "3";
 var LONG_POLL_TIMEOUT_MS = 35e3;
@@ -21898,20 +21897,10 @@ var MSG_ITEM_IMAGE = 2;
 var MSG_ITEM_VOICE = 3;
 var MSG_ITEM_FILE = 4;
 var MSG_ITEM_VIDEO = 5;
+var CHANNEL_VERSION = "1.0.3";
 function buildBaseInfo() {
   return { channel_version: CHANNEL_VERSION };
 }
-function readChannelVersion() {
-  try {
-    const dir = path.dirname(fileURLToPath(import.meta.url));
-    const pkgPath = path.resolve(dir, "package.json");
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-    return pkg.version ?? "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-var CHANNEL_VERSION = readChannelVersion();
 function getHomeDir() {
   return os.homedir();
 }
@@ -22789,8 +22778,10 @@ function computeBackoffMs(failures) {
 }
 async function processMessages(msgs) {
   for (const msg of msgs ?? []) {
-    if (msg.message_type !== MSG_TYPE_USER) continue;
     const senderId = msg.from_user_id ?? "unknown";
+    const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
+    log(`\u5165\u7AD9\u6D88\u606F: from=${senderId} msg_type=${msg.message_type} items=[${types}]`);
+    if (msg.message_type !== MSG_TYPE_USER) continue;
     if (msg.context_token) {
       cacheContextToken(senderId, msg.context_token);
     }
@@ -22798,8 +22789,8 @@ async function processMessages(msgs) {
     typingManager.startKeepalive(senderId);
     const content = await extractContentFromMessage(msg);
     if (!content) {
-      const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
-      log(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${types}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
+      const types2 = msg.item_list?.map((i) => i.type).join(",") ?? "none";
+      log(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${types2}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
       await typingManager.sendTyping(senderId, 2);
       typingManager.stopKeepalive(senderId);
       continue;

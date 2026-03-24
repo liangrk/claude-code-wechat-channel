@@ -7,8 +7,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export type AccountData = {
@@ -93,20 +91,12 @@ export const MSG_ITEM_VOICE = 3;
 export const MSG_ITEM_FILE = 4;
 export const MSG_ITEM_VIDEO = 5;
 
+// ilink 协议版本号，需与官方 @tencent-weixin/openclaw-weixin 保持一致
+export const CHANNEL_VERSION = "1.0.3";
+
 export function buildBaseInfo(): { channel_version: string } {
   return { channel_version: CHANNEL_VERSION };
 }
-export function readChannelVersion(): string {
-  try {
-    const dir = path.dirname(fileURLToPath(import.meta.url));
-    const pkgPath = path.resolve(dir, "package.json");
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8")) as { version?: string };
-    return pkg.version ?? "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-export const CHANNEL_VERSION = readChannelVersion();
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 

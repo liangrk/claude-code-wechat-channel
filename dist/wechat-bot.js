@@ -1095,15 +1095,31 @@ var require_main = __commonJS({
   }
 });
 
-// setup.ts
+// wechat-bot.ts
+import crypto3 from "node:crypto";
 import fs2 from "node:fs";
+import path2 from "node:path";
+import process2 from "node:process";
+import { spawn, execSync } from "node:child_process";
 
 // shared.ts
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 var DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 var BOT_TYPE = "3";
+var LONG_POLL_TIMEOUT_MS = 35e3;
+var CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+var MSG_ITEM_TEXT = 1;
+var MSG_ITEM_IMAGE = 2;
+var MSG_ITEM_VOICE = 3;
+var MSG_ITEM_FILE = 4;
+var MSG_ITEM_VIDEO = 5;
+var CHANNEL_VERSION = "1.0.3";
+function buildBaseInfo() {
+  return { channel_version: CHANNEL_VERSION };
+}
 function getHomeDir() {
   return os.homedir();
 }
@@ -1113,6 +1129,24 @@ function getCredentialsDir() {
 function getCredentialsFile() {
   return path.join(getCredentialsDir(), "account.json");
 }
+function getSyncBufFile() {
+  return path.join(getCredentialsDir(), "sync_buf.txt");
+}
+function getContextTokensFile() {
+  return path.join(getCredentialsDir(), "context_tokens.json");
+}
+function getLockPidFile() {
+  return path.join(getCredentialsDir(), "lock.pid");
+}
+function loadCredentials() {
+  try {
+    const file = getCredentialsFile();
+    if (!fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch {
+    return null;
+  }
+}
 function saveCredentials(data) {
   const dir = getCredentialsDir();
   const file = getCredentialsFile();
@@ -1121,6 +1155,50 @@ function saveCredentials(data) {
   try {
     fs.chmodSync(file, 384);
   } catch {
+  }
+}
+function randomWechatUin() {
+  const uint32 = crypto.randomBytes(4).readUInt32BE(0);
+  return Buffer.from(String(uint32), "utf-8").toString("base64");
+}
+function buildHeaders(token, body) {
+  const headers = {
+    "Content-Type": "application/json",
+    AuthorizationType: "ilink_bot_token",
+    "X-WECHAT-UIN": randomWechatUin()
+  };
+  if (body) {
+    headers["Content-Length"] = String(Buffer.byteLength(body, "utf-8"));
+  }
+  if (token?.trim()) {
+    headers.Authorization = `Bearer ${token.trim()}`;
+  }
+  return headers;
+}
+async function apiFetch(params) {
+  const base = params.baseUrl.endsWith("/") ? params.baseUrl : `${params.baseUrl}/`;
+  const url = new URL(params.endpoint, base).toString();
+  const headers = buildHeaders(params.token, params.body);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), params.timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: params.body,
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    const text = await res.text();
+    if (!res.ok) {
+      process.stderr.write(`[shared] API error: HTTP ${res.status} \u2014 ${text.slice(0, 500)}
+`);
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return text;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
   }
 }
 async function fetchQRCode(baseUrl) {
@@ -1158,101 +1236,815 @@ async function pollQRStatus(baseUrl, qrcode) {
   }
 }
 
-// setup.ts
-async function main() {
-  const CREDENTIALS_FILE = getCredentialsFile();
-  if (fs2.existsSync(CREDENTIALS_FILE)) {
+// typing.ts
+var TYPING_TTL_MS = 24 * 60 * 60 * 1e3;
+var TYPING_BACKOFF_BASE_MS = 5e3;
+var TYPING_MAX_BACKOFF_MS = 3e4;
+var TypingManager = class {
+  tickets = /* @__PURE__ */ new Map();
+  timers = /* @__PURE__ */ new Map();
+  failCounts = /* @__PURE__ */ new Map();
+  config = { botId: "", token: "", baseUrl: "" };
+  configure(botId, token, baseUrl) {
+    this.config = { botId, token, baseUrl };
+  }
+  getTicket(senderId) {
+    const entry = this.tickets.get(senderId);
+    if (!entry) return void 0;
+    if (Date.now() > entry.expiresAt) {
+      this.tickets.delete(senderId);
+      return void 0;
+    }
+    return entry.ticket;
+  }
+  setTicket(senderId, ticket) {
+    this.tickets.set(senderId, { ticket, expiresAt: Date.now() + TYPING_TTL_MS });
+  }
+  getBackoffMs(senderId) {
+    const count = this.failCounts.get(senderId) ?? 0;
+    return Math.min(TYPING_BACKOFF_BASE_MS * Math.pow(2, count), TYPING_MAX_BACKOFF_MS);
+  }
+  async fetchConfig(senderId) {
     try {
-      const existing = JSON.parse(fs2.readFileSync(CREDENTIALS_FILE, "utf-8"));
-      console.log(`\u5DF2\u6709\u4FDD\u5B58\u7684\u8D26\u53F7: ${existing.accountId}`);
-      console.log(`\u4FDD\u5B58\u65F6\u95F4: ${existing.savedAt}`);
-      console.log();
-      const readline = await import("node:readline");
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
+      const raw = await apiFetch({
+        baseUrl: this.config.baseUrl,
+        endpoint: "ilink/bot/getconfig",
+        body: JSON.stringify({
+          base_info: buildBaseInfo(),
+          bot_id: this.config.botId,
+          user_id: senderId
+        }),
+        token: this.config.token,
+        timeoutMs: 1e4
       });
-      const answer = await new Promise((resolve) => {
-        rl.question("\u662F\u5426\u91CD\u65B0\u767B\u5F55\uFF1F(y/N) ", resolve);
+      const resp = JSON.parse(raw);
+      if (resp.typing_ticket) {
+        this.setTicket(senderId, resp.typing_ticket);
+        this.failCounts.set(senderId, 0);
+        return resp.typing_ticket;
+      }
+    } catch {
+    }
+    return null;
+  }
+  async sendTyping(senderId, status) {
+    if (!this.config.token) return;
+    if (status === 2) {
+      const timer = this.timers.get(senderId);
+      if (timer) {
+        clearInterval(timer);
+        this.timers.delete(senderId);
+      }
+    }
+    let ticket = this.getTicket(senderId);
+    if (!ticket) {
+      ticket = await this.fetchConfig(senderId);
+      if (!ticket) return;
+    }
+    try {
+      await apiFetch({
+        baseUrl: this.config.baseUrl,
+        endpoint: "ilink/bot/sendtyping",
+        body: JSON.stringify({
+          base_info: buildBaseInfo(),
+          typing_ticket: ticket,
+          status
+        }),
+        token: this.config.token,
+        timeoutMs: 5e3
       });
-      rl.close();
-      if (answer.toLowerCase() !== "y") {
-        console.log("\u4FDD\u6301\u73B0\u6709\u51ED\u636E\uFF0C\u9000\u51FA\u3002");
-        process.exit(0);
+      this.failCounts.set(senderId, 0);
+    } catch {
+      const count = (this.failCounts.get(senderId) ?? 0) + 1;
+      this.failCounts.set(senderId, count);
+      if (count >= 3) {
+        this.tickets.delete(senderId);
+        this.failCounts.delete(senderId);
+      }
+    }
+  }
+  startKeepalive(senderId) {
+    const existing = this.timers.get(senderId);
+    if (existing) clearInterval(existing);
+    const intervalMs = this.getBackoffMs(senderId);
+    const timer = setInterval(() => {
+      this.sendTyping(senderId, 1);
+    }, intervalMs);
+    this.timers.set(senderId, timer);
+  }
+  stopKeepalive(senderId) {
+    const timer = this.timers.get(senderId);
+    if (timer) {
+      clearInterval(timer);
+      this.timers.delete(senderId);
+    }
+  }
+  stopAll() {
+    for (const timer of this.timers.values()) {
+      clearInterval(timer);
+    }
+    this.timers.clear();
+  }
+};
+
+// media.ts
+import crypto2 from "node:crypto";
+function pkcs7Unpad(buf) {
+  const padLen = buf[buf.length - 1];
+  if (padLen === 0 || padLen > 16) return buf;
+  for (let i = buf.length - padLen; i < buf.length; i++) {
+    if (buf[i] !== padLen) return buf;
+  }
+  return buf.subarray(0, buf.length - padLen);
+}
+function parseAesKey(aesKeyBase64) {
+  const decoded = Buffer.from(aesKeyBase64, "base64");
+  if (decoded.length === 16) return decoded;
+  const hexStr = decoded.toString("utf-8").trim();
+  if (/^[0-9a-fA-F]{32}$/.test(hexStr)) {
+    return Buffer.from(hexStr, "hex");
+  }
+  return decoded.subarray(0, 16);
+}
+function decryptAesEcb(ciphertext, key) {
+  const decipher = crypto2.createDecipheriv("aes-128-ecb", key, null);
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return pkcs7Unpad(decrypted);
+}
+async function downloadAndDecryptBuffer(media) {
+  if (!media.encrypt_query_param || !media.aes_key) return null;
+  try {
+    const url = `${CDN_BASE_URL}?${media.encrypt_query_param}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const contentLength = parseInt(res.headers.get("content-length") ?? "0", 10);
+    if (contentLength > MAX_DOWNLOAD_SIZE) return null;
+    const arrayBuf = await res.arrayBuffer();
+    const encrypted = Buffer.from(arrayBuf);
+    if (encrypted.length > MAX_DOWNLOAD_SIZE) return null;
+    const key = parseAesKey(media.aes_key);
+    return decryptAesEcb(encrypted, key);
+  } catch {
+    return null;
+  }
+}
+var MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024;
+
+// wechat-bot.ts
+var MAX_CONSECUTIVE_FAILURES = 3;
+var MAX_REPLY_LENGTH = 4096;
+var SEND_RETRY_COUNT = 2;
+var SEND_RETRY_DELAY_MS = 1e3;
+var CONTEXT_TOKEN_MAX_ENTRIES = 500;
+var CONTEXT_TOKEN_TTL_MS = 24 * 60 * 60 * 1e3;
+var LONG_POLL_TIMEOUT_MIN_MS = 1e4;
+var LONG_POLL_TIMEOUT_MAX_MS = 6e4;
+var CLAUDE_TIMEOUT_MS = 12e4;
+function log(msg) {
+  process2.stderr.write(`[wechat-bot] ${msg}
+`);
+}
+function logError(msg) {
+  process2.stderr.write(`[wechat-bot] ERROR: ${msg}
+`);
+}
+var MSG_TYPE_USER = 1;
+var MSG_TYPE_BOT = 2;
+var MSG_STATE_FINISH = 2;
+var contextTokenCache = /* @__PURE__ */ new Map();
+function loadContextTokens() {
+  try {
+    const file = getContextTokensFile();
+    if (!fs2.existsSync(file)) return;
+    const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(data)) {
+      if (now - entry.ts < CONTEXT_TOKEN_TTL_MS) {
+        contextTokenCache.set(key, { token: entry.token, lastAccessed: entry.ts });
+      }
+    }
+    log(`\u52A0\u8F7D context_token \u7F13\u5B58: ${contextTokenCache.size} \u6761`);
+  } catch {
+  }
+}
+function saveContextTokens() {
+  try {
+    const dir = getCredentialsDir();
+    const file = getContextTokensFile();
+    fs2.mkdirSync(dir, { recursive: true });
+    const data = {};
+    for (const [key, entry] of contextTokenCache.entries()) {
+      data[key] = { token: entry.token, ts: entry.lastAccessed };
+    }
+    fs2.writeFileSync(file, JSON.stringify(data), "utf-8");
+    try {
+      fs2.chmodSync(file, 384);
+    } catch {
+    }
+  } catch {
+  }
+}
+function evictContextTokens() {
+  const now = Date.now();
+  for (const [key, entry] of contextTokenCache.entries()) {
+    if (now - entry.lastAccessed > CONTEXT_TOKEN_TTL_MS) {
+      contextTokenCache.delete(key);
+    }
+  }
+  if (contextTokenCache.size > CONTEXT_TOKEN_MAX_ENTRIES) {
+    const entries = [...contextTokenCache.entries()].sort(
+      (a, b) => a[1].lastAccessed - b[1].lastAccessed
+    );
+    const toRemove = entries.length - CONTEXT_TOKEN_MAX_ENTRIES;
+    for (let i = 0; i < toRemove; i++) {
+      contextTokenCache.delete(entries[i][0]);
+    }
+  }
+}
+function cacheContextToken(userId, token) {
+  contextTokenCache.set(userId, { token, lastAccessed: Date.now() });
+  evictContextTokens();
+  saveContextTokens();
+}
+function getCachedContextToken(userId) {
+  const entry = contextTokenCache.get(userId);
+  if (!entry) return void 0;
+  if (Date.now() - entry.lastAccessed > CONTEXT_TOKEN_TTL_MS) {
+    contextTokenCache.delete(userId);
+    return void 0;
+  }
+  entry.lastAccessed = Date.now();
+  return entry.token;
+}
+var SESSIONS_FILE = path2.join(getCredentialsDir(), "sessions.json");
+function loadSessions() {
+  try {
+    if (!fs2.existsSync(SESSIONS_FILE)) return {};
+    return JSON.parse(fs2.readFileSync(SESSIONS_FILE, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+function saveSessions(sessions) {
+  try {
+    const dir = getCredentialsDir();
+    fs2.mkdirSync(dir, { recursive: true });
+    fs2.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions), "utf-8");
+    try {
+      fs2.chmodSync(SESSIONS_FILE, 384);
+    } catch {
+    }
+  } catch {
+  }
+}
+function clearSession(sessions, senderId) {
+  delete sessions[senderId];
+  saveSessions(sessions);
+}
+var LOCK_STALE_TIMEOUT_MS = 10 * 60 * 1e3;
+function getLockFileAge(lockFile) {
+  try {
+    const stat = fs2.statSync(lockFile);
+    return Date.now() - stat.mtimeMs;
+  } catch {
+    return Infinity;
+  }
+}
+function isLikelyWechatBot(pid) {
+  try {
+    const isWin = process2.platform === "win32";
+    const cmd = isWin ? `wmic process where "ProcessId=${pid}" get CommandLine /FORMAT:LIST 2>NUL` : `cat /proc/${pid}/cmdline 2>/dev/null || ps -p ${pid} -o command= 2>/dev/null`;
+    const output = execSync(cmd, { encoding: "utf-8", timeout: 3e3 });
+    return output.toLowerCase().includes("wechat-bot") || output.toLowerCase().includes("wechat-channel");
+  } catch {
+    return true;
+  }
+}
+function acquireLock() {
+  const lockFile = getLockPidFile();
+  try {
+    fs2.mkdirSync(getCredentialsDir(), { recursive: true });
+    try {
+      const fd = fs2.openSync(lockFile, "wx");
+      fs2.writeSync(fd, String(process2.pid));
+      fs2.closeSync(fd);
+      return true;
+    } catch (err) {
+      if (err.code === "EEXIST") {
+        try {
+          const existingPid = parseInt(fs2.readFileSync(lockFile, "utf-8").trim(), 10);
+          if (!isNaN(existingPid)) {
+            process2.kill(existingPid, 0);
+            const age = getLockFileAge(lockFile);
+            if (age > LOCK_STALE_TIMEOUT_MS) {
+              log(`\u9501\u6587\u4EF6\u5DF2\u8FC7\u671F (${Math.round(age / 6e4)} \u5206\u949F\u524D\u521B\u5EFA)\uFF0C\u5C1D\u8BD5\u6E05\u7406...`);
+            } else if (isLikelyWechatBot(existingPid)) {
+              logError(`\u53E6\u4E00\u4E2A\u5B9E\u4F8B\u5DF2\u5728\u8FD0\u884C (PID ${existingPid})\uFF0C\u9000\u51FA\u3002`);
+              return false;
+            } else {
+              log(`PID ${existingPid} \u5B58\u6D3B\u4F46\u4E0D\u662F wechat \u8FDB\u7A0B (\u53EF\u80FD PID \u590D\u7528)\uFF0C\u6E05\u7406\u9501\u6587\u4EF6...`);
+            }
+          }
+        } catch {
+        }
+        try {
+          fs2.unlinkSync(lockFile);
+          const fd = fs2.openSync(lockFile, "wx");
+          fs2.writeSync(fd, String(process2.pid));
+          fs2.closeSync(fd);
+          log("\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6\u5E76\u91CD\u65B0\u83B7\u53D6\u9501");
+          return true;
+        } catch {
+          logError("\u65E0\u6CD5\u6E05\u7406\u8FC7\u671F\u9501\u6587\u4EF6");
+          return false;
+        }
+      }
+      logError(`\u65E0\u6CD5\u521B\u5EFA\u9501\u6587\u4EF6: ${String(err)}`);
+      return false;
+    }
+  } catch (err) {
+    logError(`\u65E0\u6CD5\u83B7\u53D6\u9501\u6587\u4EF6: ${String(err)}`);
+    return false;
+  }
+}
+function releaseLock() {
+  try {
+    const lockFile = getLockPidFile();
+    if (fs2.existsSync(lockFile)) {
+      const pid = fs2.readFileSync(lockFile, "utf-8").trim();
+      if (pid === String(process2.pid)) {
+        fs2.unlinkSync(lockFile);
+      }
+    }
+  } catch {
+  }
+}
+function truncateText(text, maxLen = MAX_REPLY_LENGTH) {
+  if (text.length <= maxLen) return text;
+  log(`\u6D88\u606F\u8D85\u957F (${text.length} \u5B57\u7B26)\uFF0C\u622A\u65AD\u81F3 ${maxLen}`);
+  return text.slice(0, maxLen);
+}
+async function extractContentFromMessage(msg) {
+  if (!msg.item_list?.length) return "";
+  for (const item of msg.item_list) {
+    if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
+      const text = item.text_item.text;
+      const ref = item.ref_msg;
+      if (!ref) return text;
+      const parts = [];
+      if (ref.title) parts.push(ref.title);
+      if (ref.message_item) {
+        const refItem = ref.message_item;
+        if (refItem.text_item?.text) {
+          parts.push(refItem.text_item.text);
+        } else if (refItem.voice_item?.text) {
+          parts.push(refItem.voice_item.text);
+        }
+      }
+      if (!parts.length) return text;
+      return `[\u5F15\u7528: ${parts.join(" | ")}]
+${text}`;
+    }
+    if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
+      return `[\u8BED\u97F3] ${item.voice_item.text}`;
+    }
+    if (item.type === MSG_ITEM_IMAGE && item.image_item?.media) {
+      const buf = await downloadAndDecryptBuffer(item.image_item.media);
+      if (buf) {
+        const MAX_IMAGE_SIZE = 512 * 1024;
+        if (buf.length > MAX_IMAGE_SIZE) {
+          return `[\u56FE\u7247] (\u56FE\u7247\u8FC7\u5927: ${(buf.length / 1024).toFixed(0)}KB\uFF0C\u5DF2\u8DF3\u8FC7)`;
+        }
+        const ext = detectImageExtension(buf);
+        const b64 = buf.toString("base64");
+        return `[\u56FE\u7247] data:image/${ext};base64,${b64}`;
+      }
+      return "[\u56FE\u7247] (\u65E0\u6CD5\u4E0B\u8F7D\u6216\u89E3\u5BC6)";
+    }
+    if (item.type === MSG_ITEM_FILE && item.file_item) {
+      const fi = item.file_item;
+      const parts = ["[\u6587\u4EF6]"];
+      if (fi.file_name) parts.push(`\u540D\u79F0: ${fi.file_name}`);
+      if (fi.len) parts.push(`\u5927\u5C0F: ${formatFileSize(fi.len)}`);
+      return parts.join(" ");
+    }
+    if (item.type === MSG_ITEM_VIDEO && item.video_item) {
+      const vi = item.video_item;
+      const parts = ["[\u89C6\u9891]"];
+      if (vi.video_size) parts.push(`\u5927\u5C0F: ${formatFileSize(String(vi.video_size))}`);
+      if (vi.play_length) parts.push(`\u65F6\u957F: ${vi.play_length}\u79D2`);
+      return parts.join(" ");
+    }
+  }
+  return "";
+}
+function detectImageExtension(buf) {
+  if (buf[0] === 137 && buf[1] === 80) return "png";
+  if (buf[0] === 255 && buf[1] === 216) return "jpeg";
+  if (buf[0] === 71 && buf[1] === 73) return "gif";
+  if (buf[0] === 82 && buf[1] === 73) return "webp";
+  return "png";
+}
+function formatFileSize(sizeStr) {
+  const bytes = parseInt(sizeStr, 10);
+  if (isNaN(bytes)) return sizeStr;
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+async function getUpdates(baseUrl, token, getUpdatesBuf, timeoutMs) {
+  try {
+    const raw = await apiFetch({
+      baseUrl,
+      endpoint: "ilink/bot/getupdates",
+      body: JSON.stringify({
+        get_updates_buf: getUpdatesBuf,
+        base_info: buildBaseInfo()
+      }),
+      token,
+      timeoutMs
+    });
+    return JSON.parse(raw);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf };
+    }
+    throw err;
+  }
+}
+function generateClientId() {
+  return `claude-wechat:${Date.now()}-${crypto3.randomBytes(4).toString("hex")}`;
+}
+async function sendTextMessage(baseUrl, token, to, text, contextToken) {
+  const truncatedText = truncateText(text);
+  const clientId = generateClientId();
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: to,
+        client_id: clientId,
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{ type: MSG_ITEM_TEXT, text_item: { text: truncatedText } }],
+        context_token: contextToken
+      },
+      base_info: buildBaseInfo()
+    }),
+    token,
+    timeoutMs: 15e3
+  });
+  return clientId;
+}
+async function sendTextMessageWithRetry(baseUrl, token, to, text, contextToken) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= SEND_RETRY_COUNT; attempt++) {
+    try {
+      return await sendTextMessage(baseUrl, token, to, text, contextToken);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < SEND_RETRY_COUNT) {
+        log(`\u53D1\u9001\u5931\u8D25 (\u7B2C ${attempt + 1} \u6B21)\uFF0C${SEND_RETRY_DELAY_MS / 1e3}s \u540E\u91CD\u8BD5...`);
+        await new Promise((r) => setTimeout(r, SEND_RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastError;
+}
+async function claudeReply(senderId, content, sessions, account) {
+  const sessionId = sessions[senderId];
+  const senderName = senderId.split("@")[0] || senderId;
+  const prompt = `[\u5FAE\u4FE1\u6D88\u606F] \u6765\u81EA: ${senderName}
+${content}
+
+\u8BF7\u7528\u4E2D\u6587\u56DE\u590D\uFF0C\u4E0D\u8981\u4F7F\u7528 Markdown \u683C\u5F0F\u3002`;
+  const args = [
+    "-p",
+    prompt,
+    "--output-format",
+    "json",
+    "--dangerously-skip-permissions",
+    "--max-turns",
+    "1"
+  ];
+  if (sessionId) {
+    args.unshift("--resume", sessionId);
+  }
+  log(`\u8C03\u7528 claude ${sessionId ? `--resume ${sessionId.slice(0, 8)}...` : "(\u65B0\u4F1A\u8BDD)"} \u2014 ${content.slice(0, 50)}...`);
+  return new Promise((resolve) => {
+    const child = spawn("claude", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process2.env,
+        ANTHROPIC_API_KEY: process2.env.ANTHROPIC_API_KEY ?? ""
+      }
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+    child.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      logError(`claude -p \u8D85\u65F6 (${CLAUDE_TIMEOUT_MS / 1e3}s)`);
+      resolve("\u62B1\u6B49\uFF0C\u56DE\u590D\u8D85\u65F6\u4E86\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002");
+    }, CLAUDE_TIMEOUT_MS);
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0 || !stdout.trim()) {
+        const errSnippet = stderr.slice(0, 200) || `exit code ${code}`;
+        logError(`claude -p \u5931\u8D25: ${errSnippet}`);
+        resolve("\u62B1\u6B49\uFF0C\u5904\u7406\u6D88\u606F\u65F6\u51FA\u73B0\u4E86\u95EE\u9898\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002");
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout.trim());
+        const reply = result.result ?? result.text ?? result.output ?? JSON.stringify(result);
+        if (!sessionId && result.session_id) {
+          sessions[senderId] = result.session_id;
+          saveSessions(sessions);
+          log(`\u4FDD\u5B58\u65B0\u4F1A\u8BDD: ${senderId} \u2192 ${result.session_id.slice(0, 8)}...`);
+        }
+        log(`claude \u56DE\u590D: ${reply.slice(0, 80)}...`);
+        resolve(reply);
+      } catch {
+        const rawReply = stdout.trim().slice(0, MAX_REPLY_LENGTH);
+        log(`claude \u56DE\u590D (raw): ${rawReply.slice(0, 80)}...`);
+        resolve(rawReply);
+      }
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      logError(`claude -p \u542F\u52A8\u5931\u8D25: ${err.message}`);
+      resolve("\u62B1\u6B49\uFF0CClaude Code \u672A\u5B89\u88C5\u6216\u65E0\u6CD5\u542F\u52A8\u3002\u8BF7\u786E\u4FDD claude \u547D\u4EE4\u53EF\u7528\u3002");
+    });
+  });
+}
+var HELP_TEXT = [
+  "\u53EF\u7528\u547D\u4EE4\uFF1A",
+  "/help \u2014 \u663E\u793A\u6B64\u5E2E\u52A9",
+  "/clear \u2014 \u6E05\u7A7A\u5BF9\u8BDD\u4E0A\u4E0B\u6587\uFF0C\u5F00\u59CB\u65B0\u4F1A\u8BDD",
+  "",
+  "\u5176\u4ED6\u6D88\u606F\u4F1A\u76F4\u63A5\u53D1\u9001\u7ED9 Claude Code \u5904\u7406\u3002"
+].join("\n");
+function computeBackoffMs(failures) {
+  const base = Math.pow(2, failures) * 2e3;
+  const jitter = Math.floor(Math.random() * 1e3);
+  return Math.min(base + jitter, 6e4);
+}
+var typingManager = new TypingManager();
+async function processMessages(msgs, account, sessions) {
+  for (const msg of msgs ?? []) {
+    const senderId = msg.from_user_id ?? "unknown";
+    const types = msg.item_list?.map((i) => i.type).join(",") ?? "none";
+    log(`\u5165\u7AD9\u6D88\u606F: from=${senderId} msg_type=${msg.message_type} items=[${types}]`);
+    if (msg.message_type !== MSG_TYPE_USER) continue;
+    if (msg.context_token) {
+      cacheContextToken(senderId, msg.context_token);
+    }
+    const content = await extractContentFromMessage(msg);
+    if (!content) {
+      const itemTypes = msg.item_list?.map((i) => i.type).join(",") ?? "none";
+      log(`\u8FC7\u6EE4\u6D88\u606F: from=${senderId} item_types=[${itemTypes}] (\u65E0\u53EF\u7528\u5185\u5BB9)`);
+      continue;
+    }
+    log(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
+    const trimmed = content.trim();
+    if (trimmed === "/clear") {
+      clearSession(sessions, senderId);
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, "\u4E0A\u4E0B\u6587\u5DF2\u6E05\u7A7A\uFF0C\u4E0B\u6B21\u6D88\u606F\u5C06\u5F00\u59CB\u65B0\u4F1A\u8BDD\u3002", contextToken);
+        } catch (err) {
+          logError(`\u53D1\u9001 /clear \u56DE\u590D\u5931\u8D25: ${String(err)}`);
+        }
+      }
+      continue;
+    }
+    if (trimmed === "/help") {
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, HELP_TEXT, contextToken);
+        } catch (err) {
+          logError(`\u53D1\u9001 /help \u56DE\u590D\u5931\u8D25: ${String(err)}`);
+        }
+      }
+      continue;
+    }
+    await typingManager.sendTyping(senderId, 1);
+    typingManager.startKeepalive(senderId);
+    try {
+      const reply = await claudeReply(senderId, content, sessions, account);
+      await typingManager.sendTyping(senderId, 2);
+      typingManager.stopKeepalive(senderId);
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, reply, contextToken);
+      } else {
+        logError(`\u65E0\u6CD5\u56DE\u590D ${senderId}: \u7F3A\u5C11 context_token`);
       }
     } catch (err) {
-      console.error(`\u8BFB\u53D6\u5DF2\u6709\u51ED\u636E\u5931\u8D25: ${String(err)}`);
-    }
-  }
-  console.log("\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...\n");
-  const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
-  try {
-    const qrterm = await Promise.resolve().then(() => __toESM(require_main(), 1));
-    await new Promise((resolve) => {
-      qrterm.default.generate(
-        qrResp.qrcode_img_content,
-        { small: true },
-        (qr) => {
-          console.log(qr);
-          resolve();
+      logError(`\u5904\u7406\u6D88\u606F\u5931\u8D25: ${String(err)}`);
+      await typingManager.sendTyping(senderId, 2);
+      typingManager.stopKeepalive(senderId);
+      const contextToken = getCachedContextToken(senderId);
+      if (contextToken) {
+        try {
+          await sendTextMessageWithRetry(account.baseUrl, account.token, senderId, "\u62B1\u6B49\uFF0C\u5904\u7406\u6D88\u606F\u65F6\u51FA\u73B0\u4E86\u95EE\u9898\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u3002", contextToken);
+        } catch {
         }
-      );
-    });
-  } catch {
-    console.log(`\u8BF7\u5728\u6D4F\u89C8\u5668\u4E2D\u6253\u5F00\u6B64\u94FE\u63A5\u626B\u7801: ${qrResp.qrcode_img_content}
-`);
-  }
-  console.log("\u8BF7\u7528\u5FAE\u4FE1\u626B\u63CF\u4E0A\u65B9\u4E8C\u7EF4\u7801...\n");
-  const deadline = Date.now() + 48e4;
-  let scannedPrinted = false;
-  while (Date.now() < deadline) {
-    const status = await pollQRStatus(DEFAULT_BASE_URL, qrResp.qrcode);
-    switch (status.status) {
-      case "wait":
-        process.stdout.write(".");
-        break;
-      case "scaned":
-        if (!scannedPrinted) {
-          console.log("\n\u{1F440} \u5DF2\u626B\u7801\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4...");
-          scannedPrinted = true;
-        }
-        break;
-      case "expired":
-        console.log("\n\u4E8C\u7EF4\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C setup\u3002");
-        process.exit(1);
-        break;
-      case "confirmed": {
-        if (!status.ilink_bot_id || !status.bot_token) {
-          console.error("\n\u767B\u5F55\u5931\u8D25\uFF1A\u670D\u52A1\u5668\u672A\u8FD4\u56DE\u5B8C\u6574\u4FE1\u606F\u3002");
-          process.exit(1);
-        }
-        const account = {
-          token: status.bot_token,
-          baseUrl: status.baseurl || DEFAULT_BASE_URL,
-          accountId: status.ilink_bot_id,
-          userId: status.ilink_user_id,
-          savedAt: (/* @__PURE__ */ new Date()).toISOString()
-        };
-        saveCredentials(account);
-        console.log(`
-\u2705 \u5FAE\u4FE1\u8FDE\u63A5\u6210\u529F\uFF01`);
-        console.log(`   \u8D26\u53F7 ID: ${account.accountId}`);
-        console.log(`   \u7528\u6237 ID: ${account.userId}`);
-        console.log(`   \u51ED\u636E\u4FDD\u5B58\u81F3: ${getCredentialsFile()}`);
-        console.log();
-        console.log("\u73B0\u5728\u53EF\u4EE5\u542F\u52A8 Claude Code \u901A\u9053\uFF1A");
-        console.log(
-          "  claude --dangerously-skip-permissions"
-        );
-        process.exit(0);
       }
     }
-    await new Promise((r) => setTimeout(r, 1e3));
   }
-  console.log("\n\u767B\u5F55\u8D85\u65F6\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C\u3002");
-  process.exit(1);
+}
+async function handlePollError(err, consecutiveFailures) {
+  consecutiveFailures++;
+  logError(`\u8F6E\u8BE2\u5F02\u5E38: ${String(err)}`);
+  const delay = computeBackoffMs(consecutiveFailures);
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    logError(`\u8FDE\u7EED\u5931\u8D25 ${MAX_CONSECUTIVE_FAILURES} \u6B21\uFF0C\u7B49\u5F85 ${delay / 1e3}s`);
+  }
+  await new Promise((r) => setTimeout(r, delay));
+  return consecutiveFailures;
+}
+async function startPolling(account, sessions) {
+  const { baseUrl, token } = account;
+  let getUpdatesBuf = "";
+  let consecutiveFailures = 0;
+  let longPollTimeout = LONG_POLL_TIMEOUT_MS;
+  let emptyPollCount = 0;
+  const syncBufFile = getSyncBufFile();
+  try {
+    if (fs2.existsSync(syncBufFile)) {
+      getUpdatesBuf = fs2.readFileSync(syncBufFile, "utf-8");
+      log(`\u6062\u590D\u4E0A\u6B21\u540C\u6B65\u72B6\u6001 (${getUpdatesBuf.length} bytes)`);
+    }
+  } catch (err) {
+    log(`\u52A0\u8F7D\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
+  }
+  loadContextTokens();
+  if (account.savedAt) {
+    try {
+      const ageMs = Date.now() - new Date(account.savedAt).getTime();
+      const ageHours = Math.round(ageMs / 36e5);
+      log(`\u51ED\u636E\u4FDD\u5B58\u4E8E ${account.savedAt}\uFF0C\u8DDD\u4ECA ${ageHours} \u5C0F\u65F6`);
+    } catch {
+    }
+  }
+  log(`channel_version: ${CHANNEL_VERSION}`);
+  log("\u5F00\u59CB\u76D1\u542C\u5FAE\u4FE1\u6D88\u606F (\u72EC\u7ACB Bot \u6A21\u5F0F)...");
+  while (true) {
+    try {
+      const resp = await getUpdates(baseUrl, token, getUpdatesBuf, longPollTimeout);
+      const msgCount = resp.msgs?.length ?? 0;
+      log(`getUpdates: ret=${resp.ret ?? 0} errcode=${resp.errcode ?? 0} msgs=${msgCount} buf=${resp.get_updates_buf?.length ?? getUpdatesBuf.length}b timeout=${longPollTimeout}ms`);
+      const isError = resp.ret !== void 0 && resp.ret !== 0 || resp.errcode !== void 0 && resp.errcode !== 0;
+      if (isError) {
+        if (resp.ret === -14 || resp.errcode === -14) {
+          logError("\u4F1A\u8BDD\u5DF2\u8FC7\u671F (errcode -14)\uFF0C\u8BF7\u91CD\u65B0\u8FD0\u884C setup \u767B\u5F55");
+          logError("1 \u5C0F\u65F6\u540E\u91CD\u8BD5...");
+          await new Promise((r) => setTimeout(r, 36e5));
+          continue;
+        }
+        consecutiveFailures++;
+        logError(`getUpdates \u5931\u8D25: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`);
+        const delay = computeBackoffMs(consecutiveFailures);
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          logError(`\u8FDE\u7EED\u5931\u8D25 ${MAX_CONSECUTIVE_FAILURES} \u6B21\uFF0C\u7B49\u5F85 ${delay / 1e3}s`);
+          consecutiveFailures = 0;
+        }
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      consecutiveFailures = 0;
+      if (resp.longpolling_timeout_ms && resp.longpolling_timeout_ms >= LONG_POLL_TIMEOUT_MIN_MS && resp.longpolling_timeout_ms <= LONG_POLL_TIMEOUT_MAX_MS) {
+        longPollTimeout = resp.longpolling_timeout_ms;
+      }
+      await processMessages(resp.msgs, account, sessions);
+      if (msgCount === 0) {
+        emptyPollCount++;
+        if (emptyPollCount % 10 === 0) {
+          log(`\u5FC3\u8DF3: \u957F\u8F6E\u8BE2\u6B63\u5E38 (\u5DF2\u7A7A\u8F6E\u8BE2 ${emptyPollCount} \u6B21)`);
+        }
+      } else {
+        emptyPollCount = 0;
+      }
+      if (resp.get_updates_buf) {
+        const oldLen = getUpdatesBuf.length;
+        getUpdatesBuf = resp.get_updates_buf;
+        if (oldLen !== getUpdatesBuf.length) {
+          log(`sync_buf \u66F4\u65B0: ${oldLen}b \u2192 ${getUpdatesBuf.length}b`);
+        }
+        try {
+          fs2.mkdirSync(getCredentialsDir(), { recursive: true });
+          fs2.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
+        } catch (err) {
+          log(`\u4FDD\u5B58\u540C\u6B65\u72B6\u6001\u5931\u8D25: ${String(err)}`);
+        }
+      }
+    } catch (err) {
+      consecutiveFailures = await handlePollError(err, consecutiveFailures);
+    }
+  }
+}
+async function main() {
+  if (!acquireLock()) {
+    process2.exit(1);
+  }
+  let sessions = loadSessions();
+  log(`\u52A0\u8F7D\u4F1A\u8BDD: ${Object.keys(sessions).length} \u4E2A\u7528\u6237`);
+  const cleanup = () => {
+    typingManager.stopAll();
+    releaseLock();
+    saveContextTokens();
+  };
+  process2.on("exit", cleanup);
+  process2.on("SIGINT", () => {
+    cleanup();
+    process2.exit(0);
+  });
+  process2.on("SIGTERM", () => {
+    cleanup();
+    process2.exit(0);
+  });
+  let account = loadCredentials();
+  if (!account) {
+    log("\u672A\u627E\u5230\u5DF2\u4FDD\u5B58\u7684\u51ED\u636E\uFF0C\u542F\u52A8\u5FAE\u4FE1\u626B\u7801\u767B\u5F55...");
+    log("\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...");
+    const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
+    log("\n\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u4EE5\u4E0B\u4E8C\u7EF4\u7801\uFF1A\n");
+    try {
+      const qrterm = await Promise.resolve().then(() => __toESM(require_main(), 1));
+      await new Promise((resolve) => {
+        qrterm.default.generate(
+          qrResp.qrcode_img_content,
+          { small: true },
+          (qr) => {
+            process2.stderr.write(qr + "\n");
+            resolve();
+          }
+        );
+      });
+    } catch {
+      log(`\u4E8C\u7EF4\u7801\u94FE\u63A5: ${qrResp.qrcode_img_content}`);
+    }
+    log("\u7B49\u5F85\u626B\u7801...");
+    const deadline = Date.now() + 48e4;
+    let scannedPrinted = false;
+    while (Date.now() < deadline) {
+      const status = await pollQRStatus(DEFAULT_BASE_URL, qrResp.qrcode);
+      switch (status.status) {
+        case "wait":
+          break;
+        case "scaned":
+          if (!scannedPrinted) {
+            log("\u5DF2\u626B\u7801\uFF0C\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4...");
+            scannedPrinted = true;
+          }
+          break;
+        case "expired":
+          log("\u4E8C\u7EF4\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u542F\u52A8\u3002");
+          process2.exit(1);
+          break;
+        case "confirmed": {
+          if (!status.ilink_bot_id || !status.bot_token) {
+            logError("\u767B\u5F55\u786E\u8BA4\u4F46\u672A\u8FD4\u56DE bot \u4FE1\u606F");
+            process2.exit(1);
+          }
+          const confirmedAccount = {
+            token: status.bot_token,
+            baseUrl: status.baseurl || DEFAULT_BASE_URL,
+            accountId: status.ilink_bot_id,
+            userId: status.ilink_user_id,
+            savedAt: (/* @__PURE__ */ new Date()).toISOString()
+          };
+          saveCredentials(confirmedAccount);
+          account = confirmedAccount;
+          log("\u5FAE\u4FE1\u8FDE\u63A5\u6210\u529F\uFF01");
+          break;
+        }
+      }
+      if (account) break;
+      await new Promise((r) => setTimeout(r, 1e3));
+    }
+    if (!account) {
+      logError("\u767B\u5F55\u5931\u8D25\uFF0C\u9000\u51FA\u3002");
+      process2.exit(1);
+    }
+  } else {
+    log(`\u4F7F\u7528\u5DF2\u4FDD\u5B58\u8D26\u53F7: ${account.accountId}`);
+  }
+  typingManager.configure(account.accountId, account.token, account.baseUrl);
+  await startPolling(account, sessions);
 }
 main().catch((err) => {
-  console.error(`\u9519\u8BEF: ${err}`);
-  process.exit(1);
+  logError(`Fatal: ${String(err)}`);
+  process2.exit(1);
 });
